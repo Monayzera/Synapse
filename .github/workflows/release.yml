@@ -5,6 +5,8 @@ on:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
   workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'
 
 permissions:
   contents: read
@@ -167,6 +169,7 @@ jobs:
           if ('${{ matrix.variant }}' -eq 'windows-gpu') {
             $vars.CMAKE_GENERATOR = 'Ninja'
             $vars.CMAKE_CUDA_ARCHITECTURES = '61-real;75-real;86-real;89-real;120a-real'
+            $vars.GGML_CUDA_FA = 'OFF'
           } else {
             $vars.CFLAGS = '/arch:AVX2'
             $vars.CXXFLAGS = '/arch:AVX2'
@@ -283,6 +286,39 @@ jobs:
           if ($missing.Count -gt 0) { throw "Missing: $($missing -join ', ')" }
           Get-ChildItem src-tauri\resources -Recurse -File | Sort-Object Length -Descending | Select-Object -First 15 FullName, @{n='MiB';e={[math]::Round($_.Length/1MB,1)}} | Format-Table -AutoSize
 
+      - name: Import macOS signing certificate
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MACOS_CERT_P12}" ] || [ -z "${MACOS_CERT_PASSWORD}" ]; then
+            if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+              echo "::error::Secrets MACOS_CERT_P12 and MACOS_CERT_PASSWORD are required for releases"
+              exit 1
+            fi
+            echo "::warning::Signing secrets not set, using ad-hoc signature"
+            exit 0
+          fi
+          kc="${RUNNER_TEMP}/signing.keychain-db"
+          kp="$(openssl rand -hex 24)"
+          printf '%s' "${MACOS_CERT_P12}" | base64 --decode > "${RUNNER_TEMP}/cert.p12"
+          security create-keychain -p "${kp}" "${kc}"
+          security set-keychain-settings -lut 21600 "${kc}"
+          security unlock-keychain -p "${kp}" "${kc}"
+          security import "${RUNNER_TEMP}/cert.p12" -k "${kc}" -P "${MACOS_CERT_PASSWORD}" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${kp}" "${kc}" > /dev/null
+          security list-keychains -d user -s "${kc}" $(security list-keychains -d user | tr -d '"')
+          rm -f "${RUNNER_TEMP}/cert.p12"
+          hash="$(security find-certificate -c "Synapse Code Signing" -Z "${kc}" | awk '/SHA-1/ { print $NF }')"
+          if [ -z "${hash}" ]; then
+            echo "::error::Signing certificate not found after import"
+            exit 1
+          fi
+          echo "APPLE_SIGNING_IDENTITY=${hash}" >> "$GITHUB_ENV"
+
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -291,8 +327,42 @@ jobs:
           releaseId: ${{ needs.prepare.outputs.release_id }}
           releaseAssetNamePattern: ${{ matrix.asset }}
           uploadUpdaterJson: false
-          uploadWorkflowArtifacts: ${{ github.ref_type != 'tag' }}
+          uploadWorkflowArtifacts: ${{ github.event_name == 'workflow_dispatch' }}
           workflowArtifactNamePattern: '${{ matrix.variant }}-[bundle]'
+
+      - name: Verify macOS signature and entitlements
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$(find src-tauri/target/release/bundle/macos -maxdepth 1 -name '*.app' -print -quit)"
+          if [ -z "${app}" ]; then
+            echo "::error::App bundle not found"
+            exit 1
+          fi
+          codesign --verify --strict --verbose=2 "${app}"
+          info="$(codesign -dv "${app}" 2>&1)"
+          echo "${info}"
+          if ! grep -q 'runtime' <<< "${info}"; then
+            echo "::error::Hardened runtime flag missing"
+            exit 1
+          fi
+          ents="$(codesign -d --entitlements - --xml "${app}" 2>/dev/null || true)"
+          echo "${ents}"
+          if ! grep -q 'com.apple.security.device.audio-input' <<< "${ents}"; then
+            echo "::error::Microphone entitlement missing"
+            exit 1
+          fi
+          req="$(codesign -d -r- "${app}" 2>&1)"
+          echo "${req}"
+          if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && ! grep -q 'certificate' <<< "${req}"; then
+            echo "::error::Designated requirement is not certificate-based"
+            exit 1
+          fi
+          if ! plutil -p "${app}/Contents/Info.plist" | grep -q 'NSMicrophoneUsageDescription'; then
+            echo "::error::NSMicrophoneUsageDescription missing from Info.plist"
+            exit 1
+          fi
 
   publish:
     name: Publish release

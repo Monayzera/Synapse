@@ -52,7 +52,7 @@ Output goes to `src-tauri/target/release/bundle/`.
 
 | | Windows | macOS |
 |---|---|---|
-| Settings, models, history | `Documents\Synapse` | `~/Documents/Synapse` |
+| Settings, models, history | `Documents\Synapse` | `~/Library/Application Support/Synapse` |
 | Logs | `%LOCALAPPDATA%\com.synapse.voice\logs` | `~/Library/Application Support/com.synapse.voice/logs` |
 
 Audio and text stay on your machine unless you choose Groq or a remote AI endpoint.

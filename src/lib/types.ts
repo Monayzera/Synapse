@@ -69,7 +69,11 @@ export interface StatusPayload {
   llm: LlmState;
   error_code: string | null;
   autostart_launch: boolean;
+  mic_denied: boolean;
+  accessibility_needed: boolean;
 }
+
+export type PrivacyKind = "microphone" | "accessibility";
 
 export interface AutostartStatus {
   enabled: boolean;

@@ -19,6 +19,7 @@ mod inputhook;
 mod inputhook_mac;
 mod inject;
 mod models;
+mod permissions;
 mod pipeline;
 #[cfg(windows)]
 mod power;
@@ -47,6 +48,8 @@ use tauri_plugin_autostart::MacosLauncher;
 
 const DATA_ROOT_POINTER: &str = "data_root";
 const DATA_ROOT_WAIT: Duration = Duration::from_secs(60);
+const POINTER_READS: u32 = 5;
+const POINTER_RETRY: Duration = Duration::from_millis(200);
 const LOG_KEEP: usize = 5;
 const WINDOW_RETRIES: u32 = 8;
 
@@ -143,6 +146,7 @@ pub fn run() {
             commands::open_settings,
             commands::open_window,
             commands::hide_window,
+            commands::open_privacy_settings,
             commands::add_custom_model,
             commands::delete_model,
             commands::setup_llama_auto,
@@ -240,6 +244,7 @@ fn setup(app: &mut tauri::App, autostart_launch: bool, log_dir: PathBuf) {
     let notify_handle = handle.clone();
     let notifier: audio::Notifier = Arc::new(move || {
         if let Some(state) = notify_handle.try_state::<SharedState>() {
+            permissions::refresh_mic(&state);
             state.emit_status();
         }
     });
@@ -297,6 +302,8 @@ fn setup(app: &mut tauri::App, autostart_launch: bool, log_dir: PathBuf) {
     });
 
     app.manage(state.clone());
+
+    permissions::init(&state);
 
     build_windows(app);
 
@@ -606,6 +613,18 @@ fn wait_for_dir(dir: &Path) -> bool {
     }
 }
 
+fn read_pointer_patiently(path: &Path) -> Pointer {
+    let mut attempt: u32 = 1;
+    loop {
+        let pointer = read_pointer(path);
+        if !matches!(pointer, Pointer::Unreadable) || attempt >= POINTER_READS {
+            return pointer;
+        }
+        attempt += 1;
+        std::thread::sleep(POINTER_RETRY);
+    }
+}
+
 fn resolve_base_dir(handle: &tauri::AppHandle) -> PathBuf {
     let pointer = match handle.path().app_local_data_dir() {
         Ok(dir) => Some(dir.join(DATA_ROOT_POINTER)),
@@ -614,9 +633,23 @@ fn resolve_base_dir(handle: &tauri::AppHandle) -> PathBuf {
             None
         }
     };
-    let saved = pointer.as_deref().map(read_pointer);
+    let saved = pointer.as_deref().map(read_pointer_patiently);
     match saved {
         Some(Pointer::Found(dir)) => {
+            #[cfg(target_os = "macos")]
+            if let Some(pointer) = pointer.as_deref() {
+                match migrate_documents_root(handle, pointer, &dir) {
+                    Migration::Keep => {}
+                    Migration::Use(root) => return root,
+                    Migration::Denied => {
+                        tracing::error!(
+                            "saved data root {} is not accessible (permission denied); using a fallback for this run",
+                            dir.display()
+                        );
+                        return candidate_base_dir(handle).0;
+                    }
+                }
+            }
             if wait_for_dir(&dir) {
                 return dir;
             }
@@ -628,6 +661,12 @@ fn resolve_base_dir(handle: &tauri::AppHandle) -> PathBuf {
         }
         Some(Pointer::Unreadable) | None => candidate_base_dir(handle).0,
         Some(Pointer::Missing) => {
+            #[cfg(target_os = "macos")]
+            if let Some(pointer) = pointer.as_deref() {
+                if let Some(root) = adopt_fallback_root(handle, pointer) {
+                    return root;
+                }
+            }
             let (chosen, preferred) = candidate_base_dir(handle);
             if let (Some(pointer), true) = (pointer, preferred) {
                 let text = chosen.to_string_lossy().to_string();
@@ -641,22 +680,34 @@ fn resolve_base_dir(handle: &tauri::AppHandle) -> PathBuf {
     }
 }
 
+fn preferred_base_dir(handle: &tauri::AppHandle) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let base = handle.path().data_dir();
+    #[cfg(not(target_os = "macos"))]
+    let base = handle.path().document_dir();
+    base.ok().map(|dir| dir.join("Synapse"))
+}
+
 fn candidate_base_dir(handle: &tauri::AppHandle) -> (PathBuf, bool) {
     let mut candidates = Vec::new();
-    let documents = handle
-        .path()
-        .document_dir()
-        .ok()
-        .map(|dir| dir.join("Synapse"));
-    if let Some(documents) = &documents {
-        candidates.push(documents.clone());
+    let preferred = preferred_base_dir(handle);
+    #[cfg(target_os = "macos")]
+    let preferred = preferred.filter(|dir| {
+        let ours = adoptable(dir);
+        if !ours {
+            tracing::warn!("{} holds files that are not Synapse data; not using it", dir.display());
+        }
+        ours
+    });
+    if let Some(preferred) = &preferred {
+        candidates.push(preferred.clone());
     }
     if let Ok(data) = handle.path().app_data_dir() {
         candidates.push(data.join("Synapse"));
     }
     for base in &candidates {
         if std::fs::create_dir_all(base).is_ok() {
-            return (base.clone(), documents.as_ref() == Some(base));
+            return (base.clone(), preferred.as_ref() == Some(base));
         }
     }
     let fallback = candidates
@@ -664,6 +715,236 @@ fn candidate_base_dir(handle: &tauri::AppHandle) -> (PathBuf, bool) {
         .next()
         .unwrap_or_else(|| PathBuf::from("."));
     (fallback, false)
+}
+
+#[cfg(target_os = "macos")]
+const SF_DATALESS: u32 = 0x4000_0000;
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RootState {
+    Missing,
+    Empty,
+    Used,
+    Denied,
+    Unknown,
+}
+
+#[cfg(target_os = "macos")]
+enum Migration {
+    Keep,
+    Use(PathBuf),
+    Denied,
+}
+
+#[cfg(target_os = "macos")]
+fn root_state(dir: &Path) -> RootState {
+    match std::fs::read_dir(dir) {
+        Ok(mut entries) => {
+            if entries.next().is_none() {
+                RootState::Empty
+            } else {
+                RootState::Used
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => RootState::Missing,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            tracing::warn!("{} not accessible: {err}", dir.display());
+            RootState::Denied
+        }
+        Err(err) => {
+            tracing::warn!("{} not inspectable: {err}", dir.display());
+            RootState::Unknown
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn adoptable(dir: &Path) -> bool {
+    match root_state(dir) {
+        RootState::Missing | RootState::Empty => true,
+        RootState::Used => dir.join("config").join("settings.json").is_file(),
+        RootState::Denied | RootState::Unknown => false,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn has_dataless(path: &Path) -> std::io::Result<bool> {
+    use std::os::macos::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.st_flags() & SF_DATALESS != 0 {
+        return Ok(true);
+    }
+    if meta.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            if has_dataless(&entry?.path())? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+fn movable(from: &Path) -> bool {
+    match has_dataless(from) {
+        Ok(false) => true,
+        Ok(true) => {
+            tracing::warn!(
+                "{} holds files that are only stored in iCloud; not moving it",
+                from.display()
+            );
+            false
+        }
+        Err(err) => {
+            tracing::warn!("{} could not be checked before moving: {err}", from.display());
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn move_root(from: &Path, to: &Path) -> std::io::Result<()> {
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if is_dir(to) {
+        std::fs::remove_dir(to)?;
+    }
+    std::fs::rename(from, to)
+}
+
+#[cfg(target_os = "macos")]
+fn remember_root(pointer: &Path, root: &Path) {
+    let text = root.to_string_lossy().to_string();
+    match crate::atomic_io::write_durable(pointer, text.as_bytes()) {
+        Ok(()) => tracing::info!("data root remembered in {}", pointer.display()),
+        Err(err) => tracing::warn!("data root pointer not updated: {err}"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn relocate(from: &Path, to: &Path, pointer: &Path) -> bool {
+    if !movable(from) {
+        return false;
+    }
+    tracing::info!("moving the data root from {} to {}", from.display(), to.display());
+    match move_root(from, to) {
+        Ok(()) => {
+            remember_root(pointer, to);
+            tracing::info!("data root moved to {}", to.display());
+            true
+        }
+        Err(err) => {
+            tracing::error!(
+                "data root could not be moved to {} ({err}); keeping {}",
+                to.display(),
+                from.display()
+            );
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn migrate_documents_root(handle: &tauri::AppHandle, pointer: &Path, saved: &Path) -> Migration {
+    let Ok(documents) = handle.path().document_dir() else {
+        return Migration::Keep;
+    };
+    let legacy = documents.join("Synapse");
+    if saved != legacy.as_path() {
+        return Migration::Keep;
+    }
+    let Some(target) = preferred_base_dir(handle) else {
+        return Migration::Keep;
+    };
+    if target == legacy {
+        return Migration::Keep;
+    }
+    match root_state(&legacy) {
+        RootState::Denied => Migration::Denied,
+        RootState::Unknown => Migration::Keep,
+        RootState::Missing => match root_state(&documents) {
+            RootState::Denied => Migration::Denied,
+            RootState::Empty | RootState::Used => {
+                if !adoptable(&target) {
+                    tracing::warn!(
+                        "{} holds files that are not Synapse data; keeping {}",
+                        target.display(),
+                        legacy.display()
+                    );
+                    return Migration::Keep;
+                }
+                if let Err(err) = std::fs::create_dir_all(&target) {
+                    tracing::warn!("data root {} not creatable: {err}", target.display());
+                    return Migration::Keep;
+                }
+                tracing::info!(
+                    "old data root {} no longer exists; using {}",
+                    legacy.display(),
+                    target.display()
+                );
+                remember_root(pointer, &target);
+                Migration::Use(target)
+            }
+            RootState::Missing | RootState::Unknown => Migration::Keep,
+        },
+        legacy_state @ (RootState::Empty | RootState::Used) => match root_state(&target) {
+            RootState::Missing | RootState::Empty => {
+                if relocate(&legacy, &target, pointer) {
+                    Migration::Use(target)
+                } else {
+                    Migration::Keep
+                }
+            }
+            RootState::Used if legacy_state == RootState::Empty && adoptable(&target) => {
+                tracing::info!(
+                    "old data root {} is empty; using {}",
+                    legacy.display(),
+                    target.display()
+                );
+                remember_root(pointer, &target);
+                Migration::Use(target)
+            }
+            _ => {
+                tracing::warn!(
+                    "{} already exists; keeping {}",
+                    target.display(),
+                    legacy.display()
+                );
+                Migration::Keep
+            }
+        },
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn adopt_fallback_root(handle: &tauri::AppHandle, pointer: &Path) -> Option<PathBuf> {
+    let old = handle.path().app_data_dir().ok()?.join("Synapse");
+    if root_state(&old) != RootState::Used {
+        return None;
+    }
+    let target = match preferred_base_dir(handle) {
+        Some(target) if target != old => target,
+        _ => return Some(old),
+    };
+    match root_state(&target) {
+        RootState::Missing | RootState::Empty => {
+            if relocate(&old, &target, pointer) {
+                Some(target)
+            } else {
+                Some(old)
+            }
+        }
+        _ => {
+            tracing::warn!(
+                "{} already exists; keeping the data in {}",
+                target.display(),
+                old.display()
+            );
+            Some(old)
+        }
+    }
 }
 
 fn migrate_legacy_data(

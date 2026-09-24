@@ -500,8 +500,19 @@ async fn fetch_and_extract(
 
     for entry in std::fs::read_dir(src_dir)? {
         let entry = entry?;
-        if entry.file_type()?.is_file() {
-            let dest = bin_dir.join(entry.file_name());
+        let kind = entry.file_type()?;
+        let dest = bin_dir.join(entry.file_name());
+        #[cfg(unix)]
+        {
+            if kind.is_symlink() || kind.is_file() {
+                remove_existing(&dest)?;
+            }
+            if kind.is_symlink() {
+                std::os::unix::fs::symlink(std::fs::read_link(entry.path())?, &dest)?;
+                continue;
+            }
+        }
+        if kind.is_file() {
             std::fs::copy(entry.path(), dest)?;
         }
     }
@@ -561,6 +572,19 @@ fn find_binary(dir: &Path, name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(unix)]
+fn remove_existing(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => Err(std::io::Error::other(format!(
+            "{} is a directory",
+            path.display()
+        ))),
+        Ok(_) => std::fs::remove_file(path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 fn set_executable(path: &Path) {

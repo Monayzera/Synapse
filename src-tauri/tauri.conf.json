@@ -85,11 +85,17 @@
     "resources": ["resources/**/*"],
     "macOS": {
       "signingIdentity": "-",
-      "minimumSystemVersion": "11.0"
+      "minimumSystemVersion": "11.0",
+      "hardenedRuntime": true,
+      "entitlements": "./Entitlements.plist",
+      "files": {
+        "Resources/en.lproj/InfoPlist.strings": "./macos/en.lproj/InfoPlist.strings",
+        "Resources/pt-BR.lproj/InfoPlist.strings": "./macos/pt-BR.lproj/InfoPlist.strings"
+      }
     },
     "windows": {
       "nsis": {
-        "installMode": "perMachine",
+        "installMode": "currentUser",
         "languages": ["English", "PortugueseBR"]
       }
     }

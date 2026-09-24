@@ -4344,10 +4344,12 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "block2",
  "cpal",
  "enigo",
  "flate2",
  "futures-util",
+ "objc2",
  "ort",
  "parking_lot",
  "regex",

@@ -1,13 +1,14 @@
 use crate::config::{RecordMode, Settings};
+use crate::permissions::AccessibilityIssue;
 use crate::pipeline;
 use crate::state::SharedState;
 use parking_lot::RwLock;
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 
 type CFMachPortRef = *mut c_void;
@@ -41,6 +42,7 @@ extern "C" {
         user_info: *mut c_void,
     ) -> CFMachPortRef;
     fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
+    fn CGEventTapIsEnabled(tap: CFMachPortRef) -> bool;
     fn CGEventGetFlags(event: CGEventRef) -> u64;
     fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
 }
@@ -52,9 +54,12 @@ extern "C" {
         port: CFMachPortRef,
         order: isize,
     ) -> CFRunLoopSourceRef;
+    fn CFMachPortInvalidate(port: CFMachPortRef);
+    fn CFMachPortIsValid(port: CFMachPortRef) -> u8;
     fn CFRunLoopGetCurrent() -> CFRunLoopRef;
     fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
-    fn CFRunLoopRun();
+    fn CFRunLoopRemoveSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
+    fn CFRunLoopRunInMode(mode: CFStringRef, seconds: f64, return_after_source_handled: u8) -> i32;
     fn CFDictionaryCreate(
         allocator: CFAllocatorRef,
         keys: *const *const c_void,
@@ -66,6 +71,8 @@ extern "C" {
     fn CFRelease(cf: *const c_void);
     #[allow(non_upper_case_globals)]
     static kCFRunLoopCommonModes: CFStringRef;
+    #[allow(non_upper_case_globals)]
+    static kCFRunLoopDefaultMode: CFStringRef;
     #[allow(non_upper_case_globals)]
     static kCFBooleanTrue: *const c_void;
 }
@@ -81,9 +88,19 @@ const FLAG_CONTROL: u64 = 0x0004_0000;
 const FLAG_ALT: u64 = 0x0008_0000;
 const FLAG_COMMAND: u64 = 0x0010_0000;
 
-struct TapPort(CFMachPortRef);
-unsafe impl Send for TapPort {}
-unsafe impl Sync for TapPort {}
+const RUN_LOOP_FINISHED: i32 = 1;
+const RUN_LOOP_STOPPED: i32 = 2;
+const TRUST_CHECK_SECS: f64 = 1.0;
+const UNTRUSTED_RETRY: Duration = Duration::from_secs(5);
+const MIC_PROMPT_WAIT: Duration = Duration::from_secs(120);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TapExit {
+    Denied,
+    NoSource,
+    Revoked,
+    Lost,
+}
 
 struct Binding {
     ctrl: bool,
@@ -101,7 +118,7 @@ enum HotEvent {
 
 static BINDINGS: OnceLock<RwLock<Vec<Binding>>> = OnceLock::new();
 static DISPATCH: OnceLock<Sender<HotEvent>> = OnceLock::new();
-static TAP_PORT: OnceLock<TapPort> = OnceLock::new();
+static TAP_PORT: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
 fn bindings() -> &'static RwLock<Vec<Binding>> {
     BINDINGS.get_or_init(|| RwLock::new(Vec::new()))
@@ -146,31 +163,57 @@ pub fn start(app: AppHandle) {
         .name("synapse-hotkey-grab".to_string())
         .spawn(move || {
             let app = grab_app;
+            if !unsafe { AXIsProcessTrusted() } && crate::permissions::mic_prompt_pending() {
+                crate::hotkey::set_hook_ready(&app, false);
+                wait_for_mic_prompt();
+            }
             let trusted = prompt_accessibility();
+            tracing::info!("Accessibility trusted at startup: {trusted}");
             let mut warned = false;
             let mut attempts: u32 = 0;
             loop {
-                if run_event_tap(&app) {
-                    break;
-                }
-                attempts += 1;
+                let exit = run_event_tap(&app);
+                release_active();
                 crate::hotkey::set_hook_ready(&app, false);
-                if !warned {
-                    warned = true;
-                    let message = if trusted || unsafe { AXIsProcessTrusted() } {
-                        tracing::error!("hotkey tap denied despite Accessibility shown as granted; stale TCC entry");
-                        "macOS is blocking the global shortcut even though Accessibility looks enabled (stale permission from a previous build). In System Settings > Privacy & Security > Accessibility, remove Synapse with the minus button, add it again and turn it on."
-                    } else {
-                        tracing::error!("global hotkey tap failed; needs Accessibility permission");
-                        open_accessibility_settings();
-                        "Allow Synapse in System Settings > Privacy & Security > Accessibility. The global shortcut starts working as soon as you enable it."
-                    };
-                    crate::hotkey::report_failure(&app, message);
-                } else {
-                    tracing::debug!("hotkey tap retry {attempts} failed");
+                let trusted = unsafe { AXIsProcessTrusted() };
+                if matches!(exit, TapExit::Revoked | TapExit::Lost) {
+                    warned = false;
+                    attempts = 0;
                 }
-                let backoff = if attempts < 10 { 3 } else { 30 };
-                std::thread::sleep(Duration::from_secs(backoff));
+                match exit {
+                    TapExit::Revoked => {
+                        tracing::warn!("Accessibility permission revoked; global shortcut tap removed")
+                    }
+                    TapExit::Lost => tracing::warn!("global shortcut event tap stopped; reinstalling"),
+                    TapExit::NoSource | TapExit::Denied => {}
+                }
+                attempts = attempts.saturating_add(1);
+                let issue = match exit {
+                    TapExit::Denied if trusted => Some(AccessibilityIssue::Stale),
+                    _ if !trusted => Some(AccessibilityIssue::Missing),
+                    _ => None,
+                };
+                if let Some(issue) = issue {
+                    if !warned {
+                        warned = true;
+                        match issue {
+                            AccessibilityIssue::Stale => tracing::error!(
+                                "hotkey tap denied despite Accessibility shown as granted; stale TCC entry"
+                            ),
+                            AccessibilityIssue::Missing => tracing::error!(
+                                "global hotkey tap failed; needs Accessibility permission"
+                            ),
+                        }
+                    } else {
+                        tracing::debug!("hotkey tap retry {attempts} failed");
+                    }
+                    crate::permissions::set_accessibility_issue(&app, Some(issue));
+                }
+                let mut backoff = Duration::from_secs(if attempts < 10 { 3 } else { 30 });
+                if issue.is_some() {
+                    backoff = backoff.min(UNTRUSTED_RETRY);
+                }
+                std::thread::sleep(backoff);
             }
         });
     if let Err(err) = grab_spawn {
@@ -199,25 +242,73 @@ fn prompt_accessibility() -> bool {
     }
 }
 
-fn run_event_tap(app: &AppHandle) -> bool {
+fn wait_for_mic_prompt() {
+    tracing::info!("waiting for the microphone prompt before asking for Accessibility");
+    let deadline = Instant::now() + MIC_PROMPT_WAIT;
+    while crate::permissions::mic_prompt_pending() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn release_active() {
+    let guard = bindings().read();
+    for binding in guard.iter() {
+        if binding.active.swap(false, Ordering::Relaxed) {
+            send(HotEvent::Release);
+        }
+    }
+}
+
+fn run_event_tap(app: &AppHandle) -> TapExit {
     unsafe {
         let mask: u64 = (1u64 << KEY_DOWN) | (1u64 << KEY_UP);
         let port = CGEventTapCreate(0, 0, 0, mask, tap_callback, ptr::null_mut());
         if port.is_null() {
-            return false;
+            return TapExit::Denied;
         }
         let source = CFMachPortCreateRunLoopSource(ptr::null_mut(), port, 0);
         if source.is_null() {
-            return false;
+            tracing::warn!("event tap run loop source could not be created");
+            CFMachPortInvalidate(port);
+            CFRelease(port as *const c_void);
+            return TapExit::NoSource;
         }
         let runloop = CFRunLoopGetCurrent();
         CFRunLoopAddSource(runloop, source, kCFRunLoopCommonModes);
-        let _ = TAP_PORT.set(TapPort(port));
+        TAP_PORT.store(port, Ordering::Release);
         CGEventTapEnable(port, true);
         tracing::info!("global shortcut event tap installed");
+        crate::permissions::set_accessibility_issue(app, None);
         crate::hotkey::set_hook_ready(app, true);
-        CFRunLoopRun();
-        true
+        let exit = loop {
+            let result = CFRunLoopRunInMode(kCFRunLoopDefaultMode, TRUST_CHECK_SECS, 0);
+            if !AXIsProcessTrusted() {
+                break TapExit::Revoked;
+            }
+            if result == RUN_LOOP_FINISHED
+                || result == RUN_LOOP_STOPPED
+                || CFMachPortIsValid(port) == 0
+            {
+                break TapExit::Lost;
+            }
+            if !CGEventTapIsEnabled(port) {
+                CGEventTapEnable(port, true);
+                if !CGEventTapIsEnabled(port) {
+                    tracing::warn!("global shortcut event tap could not be enabled again; reinstalling it");
+                    break TapExit::Lost;
+                }
+                tracing::info!("global shortcut event tap was disabled; enabled it again");
+            }
+        };
+        TAP_PORT.store(ptr::null_mut(), Ordering::Release);
+        if CFMachPortIsValid(port) != 0 {
+            CGEventTapEnable(port, false);
+        }
+        CFRunLoopRemoveSource(runloop, source, kCFRunLoopCommonModes);
+        CFMachPortInvalidate(port);
+        CFRelease(source as *const c_void);
+        CFRelease(port as *const c_void);
+        exit
     }
 }
 
@@ -228,8 +319,9 @@ extern "C" fn tap_callback(
     _user: *mut c_void,
 ) -> CGEventRef {
     if etype == TAP_DISABLED_TIMEOUT || etype == TAP_DISABLED_USER_INPUT {
-        if let Some(port) = TAP_PORT.get() {
-            unsafe { CGEventTapEnable(port.0, true) };
+        let port = TAP_PORT.load(Ordering::Acquire);
+        if !port.is_null() && unsafe { AXIsProcessTrusted() } {
+            unsafe { CGEventTapEnable(port, true) };
         }
         return event;
     }
@@ -248,12 +340,6 @@ extern "C" fn tap_callback(
     } else {
         event
     }
-}
-
-fn open_accessibility_settings() {
-    let _ = std::process::Command::new("open")
-        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-        .spawn();
 }
 
 fn dispatch(app: &AppHandle, event: HotEvent) {

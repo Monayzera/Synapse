@@ -27,6 +27,11 @@ extern "C" {
     fn CFRelease(cf: *const c_void);
 }
 
+#[cfg(target_os = "macos")]
+pub fn accessibility_trusted() -> bool {
+    unsafe { AXIsProcessTrusted() }
+}
+
 pub fn inject_text(text: &str, restore_clipboard: bool, paste_delay_ms: u64) -> AppResult<()> {
     if text.trim().is_empty() {
         return Ok(());

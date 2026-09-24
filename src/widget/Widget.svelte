@@ -7,6 +7,7 @@
     StatusPayload,
     CompletePayload,
     PipelineErrorPayload,
+    PrivacyKind,
     SectionId,
     Settings,
   } from "../lib/types";
@@ -31,6 +32,8 @@
     vad_active: false,
     error: null,
     starting: true,
+    mic_denied: false,
+    accessibility_needed: false,
     hotkey_ready: true,
     llm: "off",
     error_code: null,
@@ -85,9 +88,20 @@
     return t("w.transcribing");
   });
 
-  const idle = $derived.by((): { text: string; section: SectionId | null; dim: boolean } => {
+  const idle = $derived.by((): {
+    text: string;
+    section: SectionId | null;
+    privacy?: PrivacyKind;
+    dim: boolean;
+  } => {
     if (status.starting) return { text: t("w.starting"), section: null, dim: true };
+    if (status.mic_denied) {
+      return { text: t("w.micDenied"), section: null, privacy: "microphone", dim: true };
+    }
     if (!status.audio_available) return { text: t("w.noMic"), section: "general", dim: true };
+    if (status.accessibility_needed) {
+      return { text: t("w.accessibility"), section: null, privacy: "accessibility", dim: true };
+    }
     if (!status.engine_ready) {
       if (status.status === "loading" || status.error_code === "engine_loading") {
         return { text: t("w.loading"), section: null, dim: true };
@@ -228,6 +242,10 @@
     api.openSettings(section).catch(() => {
       api.openWindow("settings").catch(() => {});
     });
+  }
+
+  function openPrivacy(kind: PrivacyKind) {
+    api.openPrivacySettings(kind).catch(() => openSection("general"));
   }
 
   onMount(() => {
@@ -413,6 +431,11 @@
             <Icon name="x" size={11} />
           </button>
         </div>
+      {:else if idle.privacy}
+        {@const kind = idle.privacy}
+        <button class="brand dim link" onclick={() => openPrivacy(kind)}>
+          {idleText}
+        </button>
       {:else if idle.section}
         {@const target = idle.section}
         <button class="brand dim link" onclick={() => openSection(target)}>

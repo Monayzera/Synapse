@@ -4,7 +4,7 @@ use crate::error::AppError;
 use crate::history::{HistoryEntry, Stats};
 use crate::models::ModelStatus;
 use crate::state::{SharedState, StatusPayload, SETTINGS_UNREADABLE};
-use crate::{audio, history, inject, models, pipeline, services};
+use crate::{audio, history, inject, models, permissions, pipeline, services};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 const SETTINGS_SECTIONS: [&str; 5] = ["general", "voice", "ai", "dictionary", "advanced"];
@@ -31,6 +31,7 @@ fn refuse_unreadable(shared: &SharedState) -> Result<(), String> {
 
 #[tauri::command]
 pub fn get_status(state: State<'_, SharedState>) -> StatusPayload {
+    permissions::refresh_mic(&state);
     state.status_payload()
 }
 
@@ -509,4 +510,9 @@ pub fn hide_window(app: AppHandle, label: String) -> Result<(), String> {
         let _ = window.hide();
     }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn open_privacy_settings(kind: String) -> Result<(), String> {
+    permissions::open_privacy_settings(&kind)
 }

@@ -14,6 +14,7 @@ import type {
   LlamaStatus,
   HardwareInfo,
   AutostartStatus,
+  PrivacyKind,
   SectionId,
 } from "./types";
 
@@ -65,6 +66,7 @@ export const api = {
   testLlm: () => invoke<string>("test_llm"),
   autostartStatus: () => invoke<AutostartStatus>("autostart_status"),
   setAutostart: (enabled: boolean) => invoke<AutostartStatus>("set_autostart", { enabled }),
+  openPrivacySettings: (kind: PrivacyKind) => invoke<void>("open_privacy_settings", { kind }),
   openSettings: (section: SectionId | null) =>
     invoke<void>("open_settings", { section }),
   openWindow: (label: string) => invoke<void>("open_window", { label }),

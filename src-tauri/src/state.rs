@@ -78,6 +78,8 @@ pub struct StatusPayload {
     pub hotkey_ready: bool,
     pub llm: LlmState,
     pub autostart_launch: bool,
+    pub mic_denied: bool,
+    pub accessibility_needed: bool,
 }
 
 pub struct AppState {
@@ -293,6 +295,8 @@ impl AppState {
             hotkey_ready,
             llm,
             autostart_launch: self.autostart_launch,
+            mic_denied: crate::permissions::mic_denied(),
+            accessibility_needed: crate::permissions::accessibility_needed(),
         }
     }
 

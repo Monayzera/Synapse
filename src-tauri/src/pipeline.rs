@@ -96,6 +96,11 @@ pub fn begin_recording(state: &SharedState) {
         emit_error(&state.app, "engine", code, &message);
         return;
     }
+    if let Some((code, message)) = crate::permissions::mic_block(state) {
+        state.recording.store(false, Ordering::Release);
+        emit_error(&state.app, "audio", code, message);
+        return;
+    }
     if !state.audio.is_available() {
         state.recording.store(false, Ordering::Release);
         state.audio.refresh();
@@ -397,10 +402,15 @@ async fn run_pipeline(
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
             tracing::warn!("injection failed: {err}");
+            let code = if paste_needs_accessibility() {
+                "accessibility_needed"
+            } else {
+                "inject_failed"
+            };
             emit_error(
                 app,
                 "inject",
-                "inject_failed",
+                code,
                 &format!("{err}. {}", inject_block_hint()),
             );
         }
@@ -539,6 +549,17 @@ fn inject_block_hint() -> &'static str {
     #[cfg(not(target_os = "macos"))]
     {
         "Elevated windows (run as administrator) block pasting; the text is on the clipboard."
+    }
+}
+
+fn paste_needs_accessibility() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        !crate::inject::accessibility_trusted()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
     }
 }
 
