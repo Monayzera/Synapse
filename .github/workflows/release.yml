@@ -1,0 +1,334 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Verify version and prepare release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      release_id: ${{ steps.release.outputs.id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - id: version
+        name: Verify versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg="$(node -p "require('./package.json').version")"
+          conf="$(node -p "require('./src-tauri/tauri.conf.json').version || ''")"
+          cargo="$(python3 -c "import tomllib;print(tomllib.load(open('src-tauri/Cargo.toml','rb'))['package']['version'])")"
+          lock="$(python3 -c "import tomllib;print(next(p['version'] for p in tomllib.load(open('src-tauri/Cargo.lock','rb'))['package'] if p['name']=='synapse'))")"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then tag="${GITHUB_REF_NAME}"; else tag="v${conf}"; fi
+          expected="${tag#v}"
+          echo "tag=${tag} package.json=${pkg} tauri.conf.json=${conf} Cargo.toml=${cargo} Cargo.lock=${lock}"
+          if ! [[ "${expected}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Version '${expected}' must be MAJOR.MINOR.PATCH"
+            exit 1
+          fi
+          fail=0
+          for pair in "package.json=${pkg}" "tauri.conf.json=${conf}" "Cargo.toml=${cargo}" "Cargo.lock=${lock}"; do
+            if [ "${pair#*=}" != "${expected}" ]; then
+              echo "::error::${pair%%=*} has '${pair#*=}', expected '${expected}'"
+              fail=1
+            fi
+          done
+          if [ "${fail}" -ne 0 ]; then exit 1; fi
+          echo "version=${expected}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Write release notes
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          prev="$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${TAG}^" 2>/dev/null || true)"
+          if [ -n "${prev}" ]; then range="${prev}..${TAG}"; else range="${TAG}"; fi
+          {
+            echo "## Changes"
+            echo
+            git log --no-merges --pretty='format:- %s' "${range}"
+            echo
+            echo
+            echo "## Downloads"
+            echo
+            echo "| File | For |"
+            echo "|---|---|"
+            echo "| \`Synapse_${VERSION}_windows_x64_nvidia-setup.exe\` | Windows with an NVIDIA GPU |"
+            echo "| \`Synapse-CPU_${VERSION}_windows_x64-setup.exe\` | Any Windows PC |"
+            echo "| \`Synapse_${VERSION}_macos_arm64.dmg\` | Mac with Apple Silicon |"
+            echo
+            echo "## First launch"
+            echo
+            echo "The installers are not code-signed yet."
+            echo
+            echo "- **Windows:** on the SmartScreen prompt, click **More info** > **Run anyway**."
+            echo "- **macOS:** open the app once, then go to System Settings > Privacy & Security > **Open Anyway**. If macOS says the app is damaged, run \`xattr -dr com.apple.quarantine /Applications/Synapse.app\`."
+            if [ -n "${prev}" ]; then
+              echo
+              echo "**Full diff:** https://github.com/${GITHUB_REPOSITORY}/compare/${prev}...${TAG}"
+            fi
+          } > "${RUNNER_TEMP}/notes.md"
+          cat "${RUNNER_TEMP}/notes.md"
+
+      - id: release
+        name: Create or reuse draft release
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          existing="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq '.[] | select(.tag_name == env.TAG) | "\(.id) \(.draft)"')"
+          existing="${existing%%$'\n'*}"
+          if [ -n "${existing}" ]; then
+            id="${existing%% *}"
+            if [ "${existing#* }" != "true" ]; then
+              echo "::error::Release ${TAG} is already published"
+              exit 1
+            fi
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/${id}" -F body=@"${RUNNER_TEMP}/notes.md" --jq '.id' > /dev/null
+          else
+            id="$(gh api -X POST "repos/${GITHUB_REPOSITORY}/releases" -f tag_name="${TAG}" -f name="Synapse ${VERSION}" -F draft=true -F prerelease=false -F body=@"${RUNNER_TEMP}/notes.md" --jq '.id')"
+          fi
+          echo "id=${id}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.variant }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.timeout }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: windows-gpu
+            os: windows-2022
+            timeout: 300
+            args: '--features cuda --bundles nsis'
+            asset: 'Synapse_[version]_windows_x64_nvidia[setup][ext]'
+          - variant: windows-cpu
+            os: windows-2022
+            timeout: 120
+            args: '--config src-tauri/tauri.cpu.conf.json --bundles nsis -- --no-default-features --features vad'
+            asset: 'Synapse-CPU_[version]_windows_x64[setup][ext]'
+          - variant: macos-arm64
+            os: macos-15
+            timeout: 120
+            args: '--features metal --bundles dmg'
+            asset: 'Synapse_[version]_macos_arm64[ext]'
+    env:
+      GGML_NATIVE: 'OFF'
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Show free disk space
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}}
+
+      - name: Configure Windows build environment
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $llvm = 'C:\Program Files\LLVM\bin'
+          if (-not (Test-Path (Join-Path $llvm 'libclang.dll'))) { throw "libclang.dll not found in $llvm" }
+          $vars = [ordered]@{ LIBCLANG_PATH = $llvm }
+          if ('${{ matrix.variant }}' -eq 'windows-gpu') {
+            $vars.CMAKE_GENERATOR = 'Ninja'
+            $vars.CMAKE_CUDA_ARCHITECTURES = '61-real;75-real;86-real;89-real;120a-real'
+          } else {
+            $vars.CFLAGS = '/arch:AVX2'
+            $vars.CXXFLAGS = '/arch:AVX2'
+          }
+          foreach ($k in $vars.Keys) { Add-Content -Path $env:GITHUB_ENV -Value "$k=$($vars[$k])" -Encoding utf8 }
+
+      - name: Install CUDA Toolkit 12.9
+        if: matrix.variant == 'windows-gpu'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $root = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9'
+          $base = 'https://developer.download.nvidia.com/compute/cuda/redist'
+          $pkgs = [ordered]@{
+            'cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.9.79-archive.zip' = '179e9c43b0735ffe67207b3da556eb5a0c50f3047961882b7657d3b822d34ef8'
+            'cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-12.9.86-archive.zip' = '227b109663b5e57d2718bcabb24a4ba0d9d4e52d958e327dc476f7c28691be85'
+            'libcublas/windows-x86_64/libcublas-windows-x86_64-12.9.2.10-archive.zip' = '62782c354e1536118caab8fe5fd295ac5fd9076e4814aba0bdaf032fe2b833ae'
+            'cuda_cccl/windows-x86_64/cuda_cccl-windows-x86_64-12.9.27-archive.zip' = '17aaa7c6b8f94a417d8f3261780b7e34b9cbdfab7513bce86768623b06aa28b5'
+          }
+          $tmp = Join-Path $env:RUNNER_TEMP 'cuda-redist'
+          New-Item -ItemType Directory -Force -Path $root, $tmp | Out-Null
+          foreach ($rel in $pkgs.Keys) {
+            $zip = Join-Path $tmp (Split-Path $rel -Leaf)
+            curl.exe -fsSL --retry 5 --retry-all-errors -o $zip "$base/$rel"
+            if ($LASTEXITCODE -ne 0) { throw "Download failed: $rel" }
+            $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($hash -ne $pkgs[$rel]) { throw "SHA256 mismatch: $rel" }
+            7z x $zip "-o$tmp" -y | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Extract failed: $rel" }
+            $dir = Join-Path $tmp ([IO.Path]::GetFileNameWithoutExtension($zip))
+            Copy-Item -Path (Join-Path $dir '*') -Destination $root -Recurse -Force
+            Remove-Item -Path $zip, $dir -Recurse -Force
+          }
+          if (-not (Test-Path (Join-Path $root 'bin\nvcc.exe'))) { throw 'nvcc.exe missing after install' }
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $root 'bin') -Encoding utf8
+          Add-Content -Path $env:GITHUB_ENV -Value "CUDA_PATH=$root" -Encoding utf8
+          Add-Content -Path $env:GITHUB_ENV -Value "CUDA_PATH_V12_9=$root" -Encoding utf8
+          Add-Content -Path $env:GITHUB_ENV -Value "CUDACXX=$root\bin\nvcc.exe" -Encoding utf8
+
+      - name: Import MSVC environment
+        if: matrix.variant == 'windows-gpu'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'Visual Studio C++ x64 toolset not found' }
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found: $vcvars" }
+          $current = @{}
+          Get-ChildItem env: | ForEach-Object { $current[$_.Name] = $_.Value }
+          $oldPath = $env:PATH -split ';'
+          $dump = cmd.exe /c "`"$vcvars`" >nul 2>&1 && set"
+          if ($LASTEXITCODE -ne 0) { throw "vcvars64.bat failed ($LASTEXITCODE)" }
+          foreach ($line in $dump) {
+            if ($line -notmatch '^([^=]+)=(.*)$') { continue }
+            $name = $Matches[1]; $value = $Matches[2]
+            if ($name -ieq 'Path') {
+              foreach ($p in ($value -split ';')) {
+                if ($p -and ($oldPath -notcontains $p)) { Add-Content -Path $env:GITHUB_PATH -Value $p -Encoding utf8 }
+              }
+            } elseif ($name -notmatch '^(GITHUB_|RUNNER_|ACTIONS_)' -and $current[$name] -ne $value) {
+              Add-Content -Path $env:GITHUB_ENV -Value "$name=$value" -Encoding utf8
+            }
+          }
+
+      - name: Verify GPU toolchain
+        if: matrix.variant == 'windows-gpu'
+        shell: pwsh
+        run: |
+          nvcc --version
+          if ($LASTEXITCODE -ne 0) { throw 'nvcc not usable' }
+          where.exe cl
+          if ($LASTEXITCODE -ne 0) { throw 'cl.exe not on PATH' }
+          cmake --version
+          ninja --version
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 'src-tauri -> target'
+          key: ${{ matrix.variant }}
+          env-vars: 'GGML CUDA LIBCLANG'
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Fetch GPU native dependencies
+        if: matrix.variant == 'windows-gpu'
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./scripts/windows/fetch-deps.ps1
+
+      - name: Verify GPU resources
+        if: matrix.variant == 'windows-gpu'
+        shell: pwsh
+        run: |
+          $required = @(
+            'src-tauri\resources\binaries\llama-server.exe',
+            'src-tauri\resources\cuda\cudart64_12.dll',
+            'src-tauri\resources\cuda\cublas64_12.dll',
+            'src-tauri\resources\cuda\cublasLt64_12.dll'
+          )
+          $missing = @($required | Where-Object { -not (Test-Path $_) })
+          if ($missing.Count -gt 0) { throw "Missing: $($missing -join ', ')" }
+          Get-ChildItem src-tauri\resources -Recurse -File | Sort-Object Length -Descending | Select-Object -First 15 FullName, @{n='MiB';e={[math]::Round($_.Length/1MB,1)}} | Format-Table -AutoSize
+
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: ${{ matrix.args }}
+          releaseId: ${{ needs.prepare.outputs.release_id }}
+          releaseAssetNamePattern: ${{ matrix.asset }}
+          uploadUpdaterJson: false
+          uploadWorkflowArtifacts: ${{ github.ref_type != 'tag' }}
+          workflowArtifactNamePattern: '${{ matrix.variant }}-[bundle]'
+
+  publish:
+    name: Publish release
+    needs: [prepare, build]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Verify assets and publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ID: ${{ needs.prepare.outputs.release_id }}
+          V: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          expected=("Synapse_${V}_windows_x64_nvidia-setup.exe" "Synapse-CPU_${V}_windows_x64-setup.exe" "Synapse_${V}_macos_arm64.dmg")
+          assets="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${ID}" --jq '.assets[] | "\(.id) \(.name)"')"
+          echo "${assets}"
+          missing=0
+          for f in "${expected[@]}"; do
+            if ! awk -v f="${f}" '$2 == f { found = 1 } END { exit !found }' <<< "${assets}"; then
+              echo "::error::Missing asset ${f}"
+              missing=1
+            fi
+          done
+          if [ "${missing}" -ne 0 ]; then exit 1; fi
+          while read -r aid name; do
+            [ -z "${aid}" ] && continue
+            keep=0
+            for f in "${expected[@]}"; do [ "${name}" = "${f}" ] && keep=1; done
+            if [ "${keep}" -eq 0 ]; then
+              echo "Removing extra asset ${name}"
+              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${aid}"
+            fi
+          done <<< "${assets}"
+          gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/${ID}" -F draft=false -f make_latest=true --jq '.html_url'

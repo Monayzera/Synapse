@@ -12,6 +12,7 @@
   import AiSection from "./AiSection.svelte";
   import DictionarySection from "./DictionarySection.svelte";
   import AdvancedSection from "./AdvancedSection.svelte";
+  import AboutSection from "./AboutSection.svelte";
 
   const reduce =
     typeof matchMedia !== "undefined" && matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -22,6 +23,7 @@
     { id: "ai", key: "nav.ai", icon: "sparkle" },
     { id: "dictionary", key: "nav.dictionary", icon: "book-open-text" },
     { id: "advanced", key: "nav.advanced", icon: "sliders-horizontal" },
+    { id: "about", key: "nav.about", icon: "info" },
   ];
 
   const current = $derived(NAV.find((n) => n.id === app.section) ?? NAV[0]);
@@ -141,8 +143,10 @@
               <AiSection {s} />
             {:else if app.section === "dictionary"}
               <DictionarySection {s} />
-            {:else}
+            {:else if app.section === "advanced"}
               <AdvancedSection {s} />
+            {:else}
+              <AboutSection />
             {/if}
           </div>
         {/key}

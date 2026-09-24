@@ -26,6 +26,12 @@ const en = {
   "nav.ai": "AI",
   "nav.dictionary": "Dictionary",
   "nav.advanced": "Advanced",
+  "nav.about": "About",
+
+  "about.version": "Version {v}",
+  "about.changes": "What's new",
+  "about.source": "Source code",
+  "about.open": "Open",
 
   "gen.shortcut": "Shortcut",
   "gen.change": "Change",
@@ -271,6 +277,12 @@ const pt: Record<TKey, string> = {
   "nav.ai": "IA",
   "nav.dictionary": "Dicionário",
   "nav.advanced": "Avançado",
+  "nav.about": "Sobre",
+
+  "about.version": "Versão {v}",
+  "about.changes": "Novidades",
+  "about.source": "Código-fonte",
+  "about.open": "Abrir",
 
   "gen.shortcut": "Atalho",
   "gen.change": "Alterar",

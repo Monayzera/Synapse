@@ -6,7 +6,12 @@ $cuda = Join-Path $resources 'cuda'
 
 New-Item -ItemType Directory -Force -Path $resources, $binaries, $cuda | Out-Null
 
+$strict = [bool]$env:CI
+$llamaTag = if ($env:LLAMA_TAG) { $env:LLAMA_TAG } else { 'b11158' }
+$llamaAsset = "llama-$llamaTag-bin-win-cuda-12.4-x64.zip"
+
 function Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
+function Fail($msg) { if ($strict) { throw $msg } else { Write-Warning "    $msg" } }
 
 Step 'Downloading Silero VAD model'
 $sileroOut = Join-Path $resources 'silero_vad.onnx'
@@ -22,16 +27,15 @@ if (-not (Test-Path $sileroOut)) {
     Write-Host '    already present'
 }
 
-Step 'Resolving latest llama.cpp Windows CUDA release'
+Step "Resolving llama.cpp $llamaTag Windows CUDA build"
 try {
     $headers = @{ 'User-Agent' = 'synapse' }
-    $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/ggml-org/llama.cpp/releases/latest' -Headers $headers
-    $asset = $release.assets |
-        Where-Object { $_.name -match '(?i)win.*cuda.*x64\.zip$' -or $_.name -match '(?i)cuda.*win.*x64\.zip$' } |
-        Select-Object -First 1
+    if ($env:GITHUB_TOKEN) { $headers['Authorization'] = "Bearer $env:GITHUB_TOKEN" }
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/$llamaTag" -Headers $headers
+    $asset = $release.assets | Where-Object { $_.name -eq $llamaAsset } | Select-Object -First 1
 
     if ($null -eq $asset) {
-        Write-Warning "    no Windows CUDA asset found in release $($release.tag_name). LLM cleanup will fall back to raw text until a llama-server.exe is placed in src-tauri/resources/binaries."
+        Fail "asset $llamaAsset not found in llama.cpp release $llamaTag"
     } else {
         Step "Downloading $($asset.name)"
         $zip = Join-Path $env:TEMP $asset.name
@@ -48,11 +52,11 @@ try {
             }
             Write-Host "    installed llama-server.exe + dlls into $binaries"
         } else {
-            Write-Warning '    llama-server.exe not found inside the archive'
+            Fail 'llama-server.exe not found inside the archive'
         }
     }
 } catch {
-    Write-Warning "    llama.cpp fetch failed: $_"
+    Fail "llama.cpp fetch failed: $_"
 }
 
 Step 'Copying CUDA runtime DLLs'
@@ -66,13 +70,17 @@ if ($null -ne $cudaVer) {
         foreach ($pattern in @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll')) {
             Get-ChildItem $cudaBin -Filter $pattern -ErrorAction SilentlyContinue | ForEach-Object {
                 Copy-Item $_.FullName (Join-Path $cuda $_.Name) -Force
-                Copy-Item $_.FullName (Join-Path $binaries $_.Name) -Force
             }
         }
     }
-    Write-Host "    copied CUDA runtime DLLs"
+    foreach ($pattern in @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll')) {
+        if (-not (Get-ChildItem $cuda -Filter $pattern -ErrorAction SilentlyContinue)) {
+            Fail "CUDA runtime DLL matching $pattern not found in $cudaVer"
+        }
+    }
+    Write-Host "    copied CUDA runtime DLLs into $cuda"
 } else {
-    Write-Warning '    CUDA Toolkit not found; GPU DLLs will rely on the user driver/runtime'
+    Fail 'CUDA Toolkit not found; GPU DLLs will rely on the user driver/runtime'
 }
 
 Write-Host 'fetch-deps complete' -ForegroundColor Green

@@ -1,6 +1,6 @@
 [package]
 name = "synapse"
-version = "0.1.0"
+version = "1.0.0"
 description = "Synapse - offline voice dictation with Whisper and local LLM cleanup"
 authors = ["Gustavo Puhlmann"]
 edition = "2021"

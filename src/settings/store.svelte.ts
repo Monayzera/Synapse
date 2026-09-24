@@ -12,7 +12,7 @@ import type {
 } from "../lib/types";
 import { tOr, locale } from "../lib/i18n.svelte";
 
-export const SECTIONS: SectionId[] = ["general", "voice", "ai", "dictionary", "advanced"];
+export const SECTIONS: SectionId[] = ["general", "voice", "ai", "dictionary", "advanced", "about"];
 
 export function isSection(value: unknown): value is SectionId {
   return typeof value === "string" && (SECTIONS as string[]).includes(value);

@@ -241,6 +241,29 @@
   text-overflow: ellipsis;
 }
 
+.about-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 16px 0;
+}
+
+.about-logo {
+  width: 44px;
+  height: 44px;
+  flex: 0 0 auto;
+  background-image: url("../lib/logo-mark.png");
+  background-size: contain;
+  background-repeat: no-repeat;
+  background-position: center;
+}
+
+.about-name {
+  font-size: 20px;
+  line-height: 1.2;
+  color: var(--ink);
+}
+
 .item-sub {
   font-size: 12.5px;
   color: var(--ink-faint);

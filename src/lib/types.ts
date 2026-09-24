@@ -6,7 +6,7 @@ export type TranscriptionBackend = "local" | "groq";
 
 export type UiLanguage = "auto" | "pt" | "en";
 
-export type SectionId = "general" | "voice" | "ai" | "dictionary" | "advanced";
+export type SectionId = "general" | "voice" | "ai" | "dictionary" | "advanced" | "about";
 
 export type LlmState = "off" | "starting" | "ready" | "failed";
 

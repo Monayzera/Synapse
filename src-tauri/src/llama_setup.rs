@@ -115,13 +115,14 @@ async fn run(app: &AppHandle, state: &SharedState) -> AppResult<()> {
         .build()
         .map_err(|e| AppError::Download(e.to_string()))?;
 
+    let prefer_gpu = state.settings_snapshot().prefer_gpu;
+
     emit(app, Stage::ResolveRelease, 0.0, 1.0, "Searching for the latest llama-server...");
-    let assets = resolve_assets(&client).await?;
+    let assets = resolve_assets(&client, prefer_gpu).await?;
 
     state.stop_sidecar();
     state.sidecar_ready.store(false, Ordering::Release);
 
-    let prefer_gpu = state.settings_snapshot().prefer_gpu;
     let used_gpu = install_binary(app, &client, &assets, &state.bin_dir, prefer_gpu).await?;
 
     set_executable(&state.bin_dir.join(BIN_NAME));
@@ -170,17 +171,21 @@ async fn run(app: &AppHandle, state: &SharedState) -> AppResult<()> {
     Ok(())
 }
 
-async fn resolve_assets(client: &reqwest::Client) -> AppResult<Vec<Asset>> {
+const RELEASES_API: &str = "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10";
+const NIGHTLY_TAG_URL: &str =
+    "https://github.com/ggml-org/llama.cpp/releases/latest/download/nightly-tag.txt";
+
+async fn resolve_assets(client: &reqwest::Client, prefer_gpu: bool) -> AppResult<Vec<Asset>> {
     let mut errors = Vec::new();
-    match resolve_via_html(client).await {
-        Ok(assets) if !assets.is_empty() => return Ok(assets),
-        Ok(_) => errors.push("github.com: no binaries listed".to_string()),
-        Err(err) => errors.push(format!("github.com: {err}")),
-    }
-    match resolve_via_api(client).await {
-        Ok(assets) if !assets.is_empty() => return Ok(assets),
-        Ok(_) => errors.push("api.github.com: empty".to_string()),
+    match resolve_via_api(client, prefer_gpu).await {
+        Ok(Some(assets)) => return Ok(assets),
+        Ok(None) => errors.push("api.github.com: no recent release has a build for this system".to_string()),
         Err(err) => errors.push(format!("api.github.com: {err}")),
+    }
+    match resolve_via_html(client).await {
+        Ok(Some(assets)) => return Ok(assets),
+        Ok(None) => errors.push("github.com: the nightly release has no build for this system".to_string()),
+        Err(err) => errors.push(format!("github.com: {err}")),
     }
     Err(AppError::Download(format!(
         "could not fetch llama-server (check your connection): {}",
@@ -188,19 +193,135 @@ async fn resolve_assets(client: &reqwest::Client) -> AppResult<Vec<Asset>> {
     )))
 }
 
-async fn resolve_via_html(client: &reqwest::Client) -> AppResult<Vec<Asset>> {
-    let latest = client
-        .get("https://github.com/ggml-org/llama.cpp/releases/latest")
+async fn resolve_via_api(
+    client: &reqwest::Client,
+    prefer_gpu: bool,
+) -> AppResult<Option<Vec<Asset>>> {
+    let response = client
+        .get(RELEASES_API)
+        .header("Accept", "application/vnd.github+json")
         .timeout(Duration::from_secs(30))
         .send()
         .await
         .map_err(|e| AppError::Download(e.to_string()))?;
-    let final_url = latest.url().as_str().to_string();
-    let tag = final_url
-        .rsplit('/')
-        .find(|s| !s.is_empty())
-        .ok_or_else(|| AppError::Download("could not identify the version".to_string()))?
-        .to_string();
+    let status = response.status();
+    if !status.is_success() {
+        return Err(AppError::Download(api_failure(status, response.headers())));
+    }
+    let value: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| AppError::Download(e.to_string()))?;
+    let releases = value
+        .as_array()
+        .ok_or_else(|| AppError::Download("unexpected response".to_string()))?;
+    Ok(select_release(releases, prefer_gpu).map(|(tag, assets)| {
+        tracing::info!("llama.cpp release {tag} selected");
+        assets
+    }))
+}
+
+fn select_release(releases: &[serde_json::Value], prefer_gpu: bool) -> Option<(String, Vec<Asset>)> {
+    let mut fallback = None;
+    for release in releases {
+        if release.get("draft").and_then(|v| v.as_bool()).unwrap_or(false) {
+            continue;
+        }
+        let tag = release
+            .get("tag_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let assets = release
+            .get("assets")
+            .and_then(|a| a.as_array())
+            .map(|list| api_assets(list))
+            .unwrap_or_default();
+        if has_wanted(&assets, prefer_gpu) {
+            return Some((tag, assets));
+        }
+        if fallback.is_none() && cpu_asset(&assets).is_some() {
+            fallback = Some((tag, assets));
+        }
+    }
+    fallback
+}
+
+fn api_assets(list: &[serde_json::Value]) -> Vec<Asset> {
+    let mut out = Vec::new();
+    for asset in list {
+        let name = asset.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let url = asset
+            .get("browser_download_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let size = asset.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+        if !name.is_empty() && !url.is_empty() {
+            out.push(Asset {
+                name: name.to_string(),
+                url: url.to_string(),
+                size,
+            });
+        }
+    }
+    out
+}
+
+fn api_failure(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) -> String {
+    let limited = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || (status == reqwest::StatusCode::FORBIDDEN
+            && (header_value(headers, "x-ratelimit-remaining") == Some("0")
+                || header_value(headers, "retry-after").is_some()));
+    if !limited {
+        return format!("GitHub returned HTTP {}", status.as_u16());
+    }
+    let wait_secs = header_value(headers, "retry-after")
+        .and_then(|v| v.parse::<u64>().ok())
+        .or_else(|| {
+            let reset = header_value(headers, "x-ratelimit-reset")?.parse::<u64>().ok()?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_secs();
+            Some(reset.saturating_sub(now))
+        });
+    match wait_secs {
+        Some(secs) => format!(
+            "GitHub rate limit reached, try again in about {} min",
+            secs.div_ceil(60).max(1)
+        ),
+        None => "GitHub rate limit reached, try again later".to_string(),
+    }
+}
+
+fn header_value<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+}
+
+async fn resolve_via_html(client: &reqwest::Client) -> AppResult<Option<Vec<Asset>>> {
+    let body = client
+        .get(NIGHTLY_TAG_URL)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| AppError::Download(e.to_string()))?
+        .error_for_status()
+        .map_err(|e| AppError::Download(e.to_string()))?
+        .text()
+        .await
+        .map_err(|e| AppError::Download(e.to_string()))?;
+    let tag = body.trim();
+    if tag.is_empty()
+        || tag.len() > 64
+        || !tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        return Err(AppError::Download("could not identify the version".to_string()));
+    }
 
     let assets_url =
         format!("https://github.com/ggml-org/llama.cpp/releases/expanded_assets/{tag}");
@@ -216,12 +337,27 @@ async fn resolve_via_html(client: &reqwest::Client) -> AppResult<Vec<Asset>> {
         .await
         .map_err(|e| AppError::Download(e.to_string()))?;
 
-    let re = regex::Regex::new(r"llama-[A-Za-z0-9._-]+?\.(?:zip|tar\.gz)")
-        .map_err(|e| AppError::Download(e.to_string()))?;
+    let out = html_assets(&html, tag)?;
+    if cpu_asset(&out).is_some() {
+        tracing::info!("llama.cpp release {tag} selected from the nightly tag");
+        Ok(Some(out))
+    } else {
+        Ok(None)
+    }
+}
+
+fn html_assets(html: &str, tag: &str) -> AppResult<Vec<Asset>> {
+    let re = regex::Regex::new(&format!(
+        r#"/releases/download/{}/([A-Za-z0-9._-]+)""#,
+        regex::escape(tag)
+    ))
+    .map_err(|e| AppError::Download(e.to_string()))?;
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for m in re.find_iter(&html) {
-        let name = m.as_str().to_string();
+    for caps in re.captures_iter(html) {
+        let Some(name) = caps.get(1).map(|m| m.as_str().to_string()) else {
+            continue;
+        };
         if !seen.insert(name.clone()) {
             continue;
         }
@@ -234,54 +370,45 @@ async fn resolve_via_html(client: &reqwest::Client) -> AppResult<Vec<Asset>> {
             size: 0,
         });
     }
-    if out.iter().any(|a| a.name.contains(&tag)) {
-        out.retain(|a| a.name.contains(&tag));
-    }
-    Ok(out)
-}
-
-async fn resolve_via_api(client: &reqwest::Client) -> AppResult<Vec<Asset>> {
-    let url = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest";
-    let value: serde_json::Value = client
-        .get(url)
-        .header("Accept", "application/vnd.github+json")
-        .timeout(Duration::from_secs(20))
-        .send()
-        .await
-        .map_err(|e| AppError::Download(e.to_string()))?
-        .error_for_status()
-        .map_err(|e| AppError::Download(e.to_string()))?
-        .json()
-        .await
-        .map_err(|e| AppError::Download(e.to_string()))?;
-    let assets = value
-        .get("assets")
-        .and_then(|a| a.as_array())
-        .ok_or_else(|| AppError::Download("unexpected response".to_string()))?;
-    let mut out = Vec::new();
-    for asset in assets {
-        let name = asset.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        let url = asset
-            .get("browser_download_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let size = asset.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
-        if !name.is_empty() && !url.is_empty() {
-            out.push(Asset {
-                name: name.to_string(),
-                url: url.to_string(),
-                size,
-            });
-        }
-    }
     Ok(out)
 }
 
 fn pick<'a>(assets: &'a [Asset], must: &[&str], must_not: &[&str]) -> Option<&'a Asset> {
     assets.iter().find(|a| {
         let lower = a.name.to_ascii_lowercase();
-        must.iter().all(|m| lower.contains(m)) && must_not.iter().all(|m| !lower.contains(m))
+        lower.starts_with("llama-")
+            && must.iter().all(|m| lower.contains(m))
+            && must_not.iter().all(|m| !lower.contains(m))
     })
+}
+
+#[cfg(windows)]
+fn gpu_asset(assets: &[Asset]) -> Option<&Asset> {
+    pick(assets, &["win", "cuda-12", "x64", ".zip"], &["cudart"])
+}
+
+fn cpu_asset(assets: &[Asset]) -> Option<&Asset> {
+    #[cfg(windows)]
+    let asset = pick(assets, &["win-cpu", "x64", ".zip"], &[]);
+    #[cfg(target_os = "macos")]
+    let asset = pick(assets, &["macos-arm64"], &[]);
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let asset = pick(assets, &["ubuntu", "x64"], &["cuda"]);
+    asset
+}
+
+fn has_wanted(assets: &[Asset], prefer_gpu: bool) -> bool {
+    #[cfg(windows)]
+    {
+        if prefer_gpu && gpu_asset(assets).is_none() {
+            return false;
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = prefer_gpu;
+    }
+    cpu_asset(assets).is_some()
 }
 
 async fn install_binary(
@@ -294,9 +421,7 @@ async fn install_binary(
     #[cfg(windows)]
     {
         if prefer_gpu {
-            if let Some(asset) =
-                pick(assets, &["win", "cuda-13", "x64", ".zip"], &["cudart"])
-            {
+            if let Some(asset) = gpu_asset(assets) {
                 fetch_and_extract(app, client, asset, bin_dir, true).await?;
                 return Ok(true);
             }
@@ -327,14 +452,7 @@ async fn install_cpu_only(
     assets: &[Asset],
     bin_dir: &Path,
 ) -> AppResult<()> {
-    #[cfg(windows)]
-    let asset = pick(assets, &["win-cpu", "x64", ".zip"], &[]);
-    #[cfg(target_os = "macos")]
-    let asset = pick(assets, &["macos-arm64"], &[]);
-    #[cfg(all(not(windows), not(target_os = "macos")))]
-    let asset = pick(assets, &["ubuntu", "x64"], &["cuda"]);
-
-    let asset = asset
+    let asset = cpu_asset(assets)
         .ok_or_else(|| AppError::Download("llama-server CPU binary not found".to_string()))?;
     let is_zip = asset.name.to_ascii_lowercase().ends_with(".zip");
     fetch_and_extract(app, client, asset, bin_dir, is_zip).await
@@ -475,4 +593,102 @@ fn configure_settings(state: &SharedState, gpu: bool, model_filename: &str) -> A
     })?;
     state.emit_settings_changed();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const NAMES: [&str; 9] = [
+        "cudart-llama-bin-win-cuda-12.4-x64.zip",
+        "cudart-llama-bin-win-cuda-13.4-x64.zip",
+        "llama-b11159-bin-macos-arm64.tar.gz",
+        "llama-b11159-bin-ubuntu-x64.tar.gz",
+        "llama-b11159-bin-win-cpu-arm64.zip",
+        "llama-b11159-bin-win-cpu-x64.zip",
+        "llama-b11159-bin-win-cuda-12.4-x64.zip",
+        "llama-b11159-bin-win-cuda-13.4-arm64.zip",
+        "llama-b11159-bin-win-cuda-13.4-x64.zip",
+    ];
+
+    fn release(tag: &str, draft: bool, names: &[&str]) -> serde_json::Value {
+        let assets: Vec<serde_json::Value> = names
+            .iter()
+            .map(|name| {
+                json!({
+                    "name": name,
+                    "browser_download_url": format!("https://github.com/ggml-org/llama.cpp/releases/download/{tag}/{name}"),
+                    "size": 1u64
+                })
+            })
+            .collect();
+        json!({ "tag_name": tag, "draft": draft, "prerelease": true, "assets": assets })
+    }
+
+    #[test]
+    fn select_release_skips_release_without_binaries_and_drafts() {
+        let releases = vec![
+            release("v0.5.0", false, &["nightly-tag.txt"]),
+            release("b11160", true, &NAMES),
+            release("b11159", false, &NAMES),
+        ];
+        let selected = select_release(&releases, false).map(|(tag, _)| tag);
+        assert_eq!(selected.as_deref(), Some("b11159"));
+        assert!(select_release(&[release("v0.5.0", false, &["nightly-tag.txt"])], true).is_none());
+    }
+
+    #[test]
+    fn pick_never_returns_cudart_archive() {
+        let assets = html_assets(
+            &NAMES
+                .iter()
+                .map(|name| format!("<a href=\"/ggml-org/llama.cpp/releases/download/b11159/{name}\" rel=\"nofollow\">"))
+                .collect::<String>(),
+            "b11159",
+        )
+        .unwrap_or_default();
+        assert_eq!(assets.len(), NAMES.len());
+        assert!(assets.iter().any(|a| a.name == "cudart-llama-bin-win-cuda-13.4-x64.zip"));
+        assert!(pick(&assets, &["cuda"], &[]).is_some_and(|a| a.name.starts_with("llama-")));
+        assert!(pick(&assets, &["cudart"], &[]).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_assets_match_expected_archives() {
+        let (_, assets) = select_release(&[release("b11159", false, &NAMES)], true).unwrap_or_default();
+        assert_eq!(
+            gpu_asset(&assets).map(|a| a.name.as_str()),
+            Some("llama-b11159-bin-win-cuda-12.4-x64.zip")
+        );
+        assert_eq!(
+            cpu_asset(&assets).map(|a| a.name.as_str()),
+            Some("llama-b11159-bin-win-cpu-x64.zip")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn gpu_preference_prefers_complete_release_then_cpu_fallback() {
+        let cpu_only = ["llama-b11161-bin-win-cpu-x64.zip"];
+        let complete = release("b11159", false, &NAMES);
+        let partial = release("b11161", false, &cpu_only);
+        let selected = select_release(&[partial.clone(), complete], true).map(|(tag, _)| tag);
+        assert_eq!(selected.as_deref(), Some("b11159"));
+        let fallback = select_release(&[partial], true).map(|(tag, _)| tag);
+        assert_eq!(fallback.as_deref(), Some("b11161"));
+    }
+
+    #[test]
+    fn api_failure_reports_rate_limit() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-ratelimit-remaining", reqwest::header::HeaderValue::from_static("0"));
+        headers.insert("retry-after", reqwest::header::HeaderValue::from_static("125"));
+        let message = api_failure(reqwest::StatusCode::FORBIDDEN, &headers);
+        assert!(message.contains("rate limit"));
+        assert!(message.contains("3 min"));
+        let other = api_failure(reqwest::StatusCode::NOT_FOUND, &reqwest::header::HeaderMap::new());
+        assert_eq!(other, "GitHub returned HTTP 404");
+    }
 }

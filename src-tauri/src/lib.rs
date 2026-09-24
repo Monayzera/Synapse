@@ -744,6 +744,63 @@ fn prepend_dll_dirs(resource_dir: &Path) {
     std::env::set_var("PATH", format!("{prefix};{current}"));
 }
 
+#[cfg(all(windows, target_env = "msvc", feature = "cuda"))]
+#[repr(C)]
+struct DelayLoadInfo {
+    cb: u32,
+    _pidd: *const core::ffi::c_void,
+    _ppfn: *mut core::ffi::c_void,
+    sz_dll: *const core::ffi::c_char,
+}
+
+#[cfg(all(windows, target_env = "msvc", feature = "cuda"))]
+#[no_mangle]
+#[allow(non_upper_case_globals)]
+static __pfnDliNotifyHook2: Option<
+    extern "system" fn(u32, *const DelayLoadInfo) -> *mut core::ffi::c_void,
+> = Some(cuda_delay_load_hook);
+
+#[cfg(all(windows, target_env = "msvc", feature = "cuda"))]
+extern "system" fn cuda_delay_load_hook(
+    notify: u32,
+    info: *const DelayLoadInfo,
+) -> *mut core::ffi::c_void {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::System::LibraryLoader::{LoadLibraryExW, LOAD_WITH_ALTERED_SEARCH_PATH};
+
+    const DLI_NOTE_PRE_LOAD_LIBRARY: u32 = 1;
+    if notify != DLI_NOTE_PRE_LOAD_LIBRARY || info.is_null() {
+        return std::ptr::null_mut();
+    }
+    let info = unsafe { &*info };
+    if (info.cb as usize) < std::mem::size_of::<DelayLoadInfo>() || info.sz_dll.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Ok(name) = unsafe { std::ffi::CStr::from_ptr(info.sz_dll) }.to_str() else {
+        return std::ptr::null_mut();
+    };
+    let Ok(exe) = std::env::current_exe() else {
+        return std::ptr::null_mut();
+    };
+    let Some(exe_dir) = exe.parent() else {
+        return std::ptr::null_mut();
+    };
+    let path = exe_dir.join("resources").join("cuda").join(name);
+    if !path.is_file() {
+        return std::ptr::null_mut();
+    }
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    match unsafe { LoadLibraryExW(PCWSTR(wide.as_ptr()), None, LOAD_WITH_ALTERED_SEARCH_PATH) } {
+        Ok(module) => module.0,
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 
 fn install_panic_hook() {
     let previous = std::panic::take_hook();
