@@ -1,4 +1,8 @@
 <p align="center">
+  <img src=".github/assets/banner.jpg" alt="Synapse" width="100%">
+</p>
+
+<p align="center">
   <img src="https://readme-typing-svg.demolab.com?font=Fira+Code&weight=600&size=22&pause=1000&color=B3C499&center=true&vCenter=true&width=620&height=58&lines=Hold+a+hotkey.+Talk.+Release.;Local+speech-to-text%2C+fully+offline.;Optional+AI+cleanup+%26+translation." alt="Hold a hotkey. Talk. Release.">
 </p>
 
