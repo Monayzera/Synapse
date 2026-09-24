@@ -1,0 +1,49 @@
+# dependencies
+/node_modules
+/dist
+/dist-ssr
+
+# rust / tauri build output
+/src-tauri/target
+/src-tauri/gen
+
+# runtime logs
+/logs
+*.log
+
+# fetched native deps (run scripts/windows/fetch-deps.ps1) - too large for git
+/src-tauri/resources/binaries/
+/src-tauri/resources/cuda/
+/src-tauri/resources/onnxruntime*.dll
+
+# downloaded models (live in %APPDATA%, never in the repo)
+*.gguf
+*.bin
+
+# scratch / tooling
+/.playwright-mcp
+.toolchain-install.log
+
+# os / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+*.suo
+*.user
+
+# secrets
+.env
+.env.*
+
+# auto-generated mobile icons (desktop-only project)
+/src-tauri/icons/android
+/src-tauri/icons/ios
+
+# raw source images (banner lives in .github/assets)
+/ChatGPT Image*.png
+
+# local-only working files (kept on disk, never published)
+/.claude
+/CLAUDE.md
+/MEMORY.md
+/synapse-widget.png

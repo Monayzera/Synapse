@@ -1,0 +1,94 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Synapse",
+  "version": "0.1.0",
+  "identifier": "com.synapse.voice",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "widget",
+        "url": "index.html",
+        "title": "Synapse",
+        "width": 320,
+        "height": 40,
+        "minWidth": 320,
+        "minHeight": 40,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": false,
+        "focus": false,
+        "center": false,
+        "visible": true
+      },
+      {
+        "label": "settings",
+        "url": "settings.html",
+        "title": "Synapse - Ajustes",
+        "width": 840,
+        "height": 640,
+        "minWidth": 700,
+        "minHeight": 520,
+        "resizable": true,
+        "decorations": false,
+        "transparent": true,
+        "center": true,
+        "visible": false
+      },
+      {
+        "label": "history",
+        "url": "history.html",
+        "title": "Synapse - Historico",
+        "width": 880,
+        "height": 660,
+        "minWidth": 720,
+        "minHeight": 520,
+        "resizable": true,
+        "decorations": false,
+        "transparent": true,
+        "center": true,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Productivity",
+    "shortDescription": "Offline voice dictation with local LLM cleanup",
+    "longDescription": "Synapse turns speech into intended text using local Whisper transcription and a local LLM cleanup pass, injected into any focused window. 100 percent offline by default.",
+    "publisher": "Synapse",
+    "copyright": "Copyright (c) 2026 Synapse",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": ["resources/**/*"],
+    "macOS": {
+      "signingIdentity": "-",
+      "minimumSystemVersion": "11.0"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "languages": ["English", "PortugueseBR"]
+      }
+    }
+  }
+}

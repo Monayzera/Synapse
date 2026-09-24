@@ -1,0 +1,8 @@
+[env]
+MACOSX_DEPLOYMENT_TARGET = { value = "11.0", force = true }
+
+[target.aarch64-apple-darwin]
+rustflags = "-lc++ -l framework=Accelerate"
+
+[target.x86_64-apple-darwin]
+rustflags = "-lc++ -l framework=Accelerate"
