@@ -29,6 +29,7 @@ mod sound;
 mod state;
 mod transcribe;
 mod tray;
+mod updater;
 mod vad;
 mod widget_pos;
 
@@ -92,7 +93,9 @@ pub fn run() {
             show_window(app, "widget");
         }))
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_positioner::init());
+        .plugin(tauri_plugin_positioner::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_updater::Builder::new().build());
     #[cfg(target_os = "macos")]
     let builder = builder.plugin(tauri_plugin_autostart::init(
         MacosLauncher::LaunchAgent,
@@ -153,7 +156,11 @@ pub fn run() {
             commands::llama_status,
             hardware::hardware_info,
             hf::hf_detect,
-            hf::hf_list_files
+            hf::hf_list_files,
+            updater::update_status,
+            updater::check_update,
+            updater::install_update,
+            updater::take_update_notice
         ])
         .build(context);
 
@@ -315,6 +322,8 @@ fn setup(app: &mut tauri::App, autostart_launch: bool, log_dir: PathBuf) {
 
     #[cfg(target_os = "macos")]
     inputhook_mac::start(handle.clone());
+
+    updater::init(&handle);
 
     if let Err(err) = tray::build(&handle, &ui_language) {
         tracing::error!("tray icon unavailable: {err}");

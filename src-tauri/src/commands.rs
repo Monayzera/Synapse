@@ -70,6 +70,9 @@ pub async fn update_settings(
             tracing::warn!("autostart change not applied: {err}");
         }
     }
+    if old.auto_update != new.auto_update {
+        crate::updater::auto_changed(&app, new.auto_update);
+    }
 
     shared.emit_settings_changed();
     shared.emit_status();

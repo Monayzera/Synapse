@@ -10,6 +10,7 @@
     PrivacyKind,
     SectionId,
     Settings,
+    UpdateNotice,
   } from "../lib/types";
   import Icon from "../lib/Icon.svelte";
   import { t, tOr, setLanguage } from "../lib/i18n.svelte";
@@ -122,11 +123,48 @@
 
   const idleText = $derived(idle.text);
 
-  function showFlash(text: string, kind: "ok" | "err") {
+  function showFlash(text: string, kind: "ok" | "err", holdMs?: number) {
     if (!text) return;
     flash = { text: text.length > 220 ? text.slice(0, 219) + "…" : text, kind };
     clearTimeout(flashTimer);
-    flashTimer = setTimeout(() => (flash = null), kind === "err" ? 7000 : 2600);
+    flashTimer = setTimeout(() => (flash = null), holdMs ?? (kind === "err" ? 7000 : 2600));
+  }
+
+  function showUpdateNotice(payload: UpdateNotice | null | undefined) {
+    if (!payload || typeof payload !== "object" || typeof payload.kind !== "string") return;
+    const v = typeof payload.version === "string" ? payload.version : "";
+    switch (payload.kind) {
+      case "installing":
+        showFlash(t("w.updInstalling", { v }), "ok", 30000);
+        break;
+      case "installed":
+        showFlash(t("w.updInstalled", { v }), "ok", 4000);
+        break;
+      case "up_to_date":
+        showFlash(t("w.updLatest"), "ok");
+        break;
+      case "downloading":
+        showFlash(t("w.updDownloading", { v }), "ok");
+        break;
+      case "available":
+        showFlash(t("w.updAvailable", { v }), "ok");
+        break;
+      case "failed":
+        showFlash(t("w.updFailed"), "err");
+        break;
+      case "check_failed":
+        showFlash(t("w.updCheckFailed"), "err");
+        break;
+      case "postponed":
+        showFlash(t("w.updPostponed"), "ok");
+        break;
+      case "busy":
+        showFlash(t("w.updBusy"), "err");
+        break;
+      case "relocate":
+        showFlash(t("w.updMove"), "err");
+        break;
+    }
   }
 
   const centerText = $derived.by(() => {
@@ -303,6 +341,7 @@
         ),
         on("transcription-empty", () => showFlash(t("w.noSpeech"), "err")),
         on("transcription-cancelled", () => showFlash(t("w.cancelled"), "err")),
+        on<UpdateNotice>("update-notice", (e) => showUpdateNotice(e.payload)),
         on<Settings>("settings-changed", (e) => {
           if (e.payload && typeof e.payload === "object") setLanguage(e.payload.ui_language);
         }),
@@ -341,6 +380,11 @@
           await new Promise((r) => setTimeout(r, Math.min(2000, 300 + attempt * 200)));
         }
       }
+      if (disposed) return;
+      try {
+        const notice = await api.takeUpdateNotice();
+        if (!disposed) showUpdateNotice(notice);
+      } catch (_) {}
     })().catch(() => {});
 
     updateDockSide();

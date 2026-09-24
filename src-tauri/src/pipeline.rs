@@ -47,6 +47,15 @@ fn busy_error(app: &AppHandle) {
 }
 
 pub fn begin_recording(state: &SharedState) {
+    if crate::updater::install_committed() {
+        emit_error(
+            &state.app,
+            "update",
+            "updating",
+            "Synapse is installing an update; please wait.",
+        );
+        return;
+    }
     if state.busy.load(Ordering::Acquire) {
         busy_error(&state.app);
         return;

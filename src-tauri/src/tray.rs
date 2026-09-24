@@ -1,10 +1,14 @@
 use crate::pipeline;
 use crate::state::SharedState;
-use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder};
+use crate::updater::{self, TrayItem};
+use parking_lot::Mutex;
+use tauri::menu::{Menu, MenuBuilder, MenuItem, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, Wry};
 
 const TRAY_ID: &str = "main";
+
+static UPDATE_ITEM: Mutex<Option<MenuItem<Wry>>> = Mutex::new(None);
 
 struct Labels {
     toggle: &'static str,
@@ -12,6 +16,11 @@ struct Labels {
     settings: &'static str,
     history: &'static str,
     quit: &'static str,
+    update_check: &'static str,
+    update_checking: &'static str,
+    update_downloading: &'static str,
+    update_install: &'static str,
+    update_installing: &'static str,
 }
 
 const PT: Labels = Labels {
@@ -20,6 +29,11 @@ const PT: Labels = Labels {
     settings: "Ajustes",
     history: "Histórico e estatísticas",
     quit: "Sair do Synapse",
+    update_check: "Verificar atualizações",
+    update_checking: "Verificando atualizações…",
+    update_downloading: "Baixando atualização… {pct}%",
+    update_install: "Instalar atualização v{v}",
+    update_installing: "Instalando atualização…",
 };
 
 const EN: Labels = Labels {
@@ -28,6 +42,11 @@ const EN: Labels = Labels {
     settings: "Settings",
     history: "History and statistics",
     quit: "Quit Synapse",
+    update_check: "Check for updates",
+    update_checking: "Checking for updates…",
+    update_downloading: "Downloading update… {pct}%",
+    update_install: "Install update v{v}",
+    update_installing: "Installing update…",
 };
 
 pub fn resolve_language(ui_language: &str) -> &'static str {
@@ -87,23 +106,80 @@ fn labels(ui_language: &str) -> &'static Labels {
     }
 }
 
-fn build_menu(app: &AppHandle, ui_language: &str) -> tauri::Result<Menu<Wry>> {
+fn update_text(ui_language: &str, item: &TrayItem) -> (String, bool) {
+    let text = labels(ui_language);
+    match item {
+        TrayItem::Check => (text.update_check.to_string(), true),
+        TrayItem::Checking => (text.update_checking.to_string(), false),
+        TrayItem::Downloading(pct) => (
+            text.update_downloading.replace("{pct}", &pct.to_string()),
+            false,
+        ),
+        TrayItem::Install(version) => (text.update_install.replace("{v}", version), true),
+        TrayItem::Installing => (text.update_installing.to_string(), false),
+    }
+}
+
+fn build_menu(
+    app: &AppHandle,
+    ui_language: &str,
+) -> tauri::Result<(Menu<Wry>, Option<MenuItem<Wry>>)> {
     let text = labels(ui_language);
     let toggle = MenuItemBuilder::with_id("toggle", text.toggle).build(app)?;
     let widget = MenuItemBuilder::with_id("widget", text.widget).build(app)?;
     let settings = MenuItemBuilder::with_id("settings", text.settings).build(app)?;
     let history = MenuItemBuilder::with_id("history", text.history).build(app)?;
     let quit = MenuItemBuilder::with_id("quit", text.quit).build(app)?;
+    let update = match updater::current_tray_item(app) {
+        Some(item) => {
+            let (label, enabled) = update_text(ui_language, &item);
+            Some(
+                MenuItemBuilder::with_id("update", label)
+                    .enabled(enabled)
+                    .build(app)?,
+            )
+        }
+        None => None,
+    };
 
-    MenuBuilder::new(app)
+    let mut menu = MenuBuilder::new(app)
         .items(&[&toggle, &widget, &settings, &history])
-        .separator()
-        .item(&quit)
-        .build()
+        .separator();
+    if let Some(update) = &update {
+        menu = menu.item(update);
+    }
+    let menu = menu.item(&quit).build()?;
+    Ok((menu, update))
+}
+
+fn adopt_update_item(app: &AppHandle, item: Option<MenuItem<Wry>>) {
+    *UPDATE_ITEM.lock() = item;
+    updater::refresh_tray(app);
+}
+
+pub fn set_update_item(item: &TrayItem, language: &str) {
+    let Some(entry) = UPDATE_ITEM.lock().clone() else {
+        return;
+    };
+    let (label, enabled) = update_text(language, item);
+    if let Err(err) = entry.set_text(label) {
+        tracing::debug!("tray update item text not set: {err}");
+    }
+    if let Err(err) = entry.set_enabled(enabled) {
+        tracing::debug!("tray update item state not set: {err}");
+    }
+}
+
+pub fn set_visible(app: &AppHandle, visible: bool) {
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        if let Err(err) = tray.set_visible(visible) {
+            tracing::warn!("tray visibility change failed: {err}");
+        }
+    }
 }
 
 pub fn build(app: &AppHandle, ui_language: &str) -> tauri::Result<()> {
-    let menu = build_menu(app, ui_language)?;
+    let (menu, update) = build_menu(app, ui_language)?;
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .tooltip("Synapse")
@@ -126,6 +202,7 @@ pub fn build(app: &AppHandle, ui_language: &str) -> tauri::Result<()> {
         .icon_as_template(false);
 
     builder.build(app)?;
+    adopt_update_item(app, update);
     tracing::info!("tray ready (language {})", resolve_language(ui_language));
     Ok(())
 }
@@ -139,10 +216,11 @@ pub fn refresh(app: &AppHandle, ui_language: &str) {
         }
     };
     match build_menu(app, ui_language) {
-        Ok(menu) => {
+        Ok((menu, update)) => {
             if let Err(err) = tray.set_menu(Some(menu)) {
                 tracing::warn!("tray menu refresh failed: {err}");
             } else {
+                adopt_update_item(app, update);
                 tracing::info!("tray language set to {}", resolve_language(ui_language));
             }
         }
@@ -160,7 +238,11 @@ fn handle_menu(app: &AppHandle, id: &str) {
         "widget" => show(app, "widget"),
         "settings" => show(app, "settings"),
         "history" => show(app, "history"),
+        "update" => updater::tray_clicked(app),
         "quit" => {
+            if updater::quit_with_update(app) {
+                return;
+            }
             if let Some(state) = app.try_state::<SharedState>() {
                 state.stop_sidecar();
             }

@@ -61,6 +61,40 @@ jobs:
           echo "version=${expected}" >> "$GITHUB_OUTPUT"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
+      - name: Verify updater signing key
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY}" ]; then
+            echo "::error::Secret TAURI_SIGNING_PRIVATE_KEY is required for releases"
+            exit 1
+          fi
+          pubkey="$(jq -er '.plugins.updater.pubkey' src-tauri/tauri.conf.json)"
+          prev="$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${TAG}^" 2>/dev/null || true)"
+          if [ -n "${prev}" ]; then
+            old="$(git show "${prev}:src-tauri/tauri.conf.json" | jq -r '.plugins.updater.pubkey // empty')"
+            if [ -n "${old}" ] && [ "${old}" != "${pubkey}" ]; then
+              echo "::error::The updater public key changed since ${prev}; installed apps would reject this release"
+              exit 1
+            fi
+          fi
+          for attempt in 1 2 3; do
+            if sudo apt-get update -qq && sudo apt-get install -y -qq minisign; then break; fi
+            sleep 10
+          done
+          command -v minisign
+          npm ci --ignore-scripts --no-audit --no-fund
+          probe="${RUNNER_TEMP}/updater-probe.bin"
+          head -c 65536 /dev/urandom > "${probe}"
+          node node_modules/@tauri-apps/cli/tauri.js signer sign -p "" "${probe}" > /dev/null
+          printf '%s' "${pubkey}" | base64 --decode > "${RUNNER_TEMP}/updater.pub"
+          base64 --decode "${probe}.sig" > "${probe}.minisig"
+          minisign -V -p "${RUNNER_TEMP}/updater.pub" -m "${probe}" -x "${probe}.minisig"
+
       - name: Write release notes
         if: github.ref_type == 'tag'
         shell: bash
@@ -146,12 +180,28 @@ jobs:
           - variant: macos-arm64
             os: macos-15
             timeout: 120
-            args: '--features metal --bundles dmg'
+            args: '--features metal --bundles app,dmg'
             asset: 'Synapse_[version]_macos_arm64[ext]'
     env:
       GGML_NATIVE: 'OFF'
     steps:
       - uses: actions/checkout@v7
+
+      - name: Prepare updater signing
+        id: updater
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "${TAURI_SIGNING_PRIVATE_KEY}" ]; then
+            echo "config=--config src-tauri/tauri.updater.conf.json" >> "$GITHUB_OUTPUT"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "::error::Secret TAURI_SIGNING_PRIVATE_KEY is required for releases"
+            exit 1
+          else
+            echo "::warning::TAURI_SIGNING_PRIVATE_KEY not set, building without updater artifacts"
+          fi
 
       - name: Show free disk space
         if: runner.os == 'Windows'
@@ -322,8 +372,9 @@ jobs:
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         with:
-          args: ${{ matrix.args }}
+          args: ${{ steps.updater.outputs.config }} ${{ matrix.args }}
           releaseId: ${{ needs.prepare.outputs.release_id }}
           releaseAssetNamePattern: ${{ matrix.asset }}
           uploadUpdaterJson: false
@@ -369,36 +420,104 @@ jobs:
     needs: [prepare, build]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     permissions:
       contents: write
     steps:
-      - name: Verify assets and publish
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            src-tauri/tauri.conf.json
+          sparse-checkout-cone-mode: false
+
+      - name: Install minisign
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if sudo apt-get update -qq && sudo apt-get install -y -qq minisign; then break; fi
+            sleep 10
+          done
+          command -v minisign
+
+      - name: Verify assets, write latest.json and publish
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ID: ${{ needs.prepare.outputs.release_id }}
           V: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
-          expected=("Synapse_${V}_windows_x64_nvidia-setup.exe" "Synapse-CPU_${V}_windows_x64-setup.exe" "Synapse_${V}_macos_arm64.dmg")
-          assets="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${ID}" --jq '.assets[] | "\(.id) \(.name)"')"
-          echo "${assets}"
+          R="${GITHUB_REPOSITORY}"
+          draft="$(gh api "repos/${R}/releases/${ID}" --jq '.draft')"
+          if [ "${draft}" != "true" ]; then
+            echo "::error::Release ${TAG} is already published; publish it only through this job while it is a draft"
+            exit 1
+          fi
+          work="${RUNNER_TEMP}/publish"
+          mkdir -p "${work}"
+          nvidia="Synapse_${V}_windows_x64_nvidia-setup.exe"
+          cpu="Synapse-CPU_${V}_windows_x64-setup.exe"
+          mac="Synapse_${V}_macos_arm64.app.tar.gz"
+          updaters=("${nvidia}" "${cpu}" "${mac}")
+          expected=("Synapse_${V}_macos_arm64.dmg")
+          for f in "${updaters[@]}"; do expected+=("${f}" "${f}.sig"); done
+          gh api --paginate "repos/${R}/releases/${ID}/assets?per_page=100" --jq '.[] | [.id, .name, .state, .size] | @tsv' > "${work}/assets.tsv"
+          cat "${work}/assets.tsv"
           missing=0
           for f in "${expected[@]}"; do
-            if ! awk -v f="${f}" '$2 == f { found = 1 } END { exit !found }' <<< "${assets}"; then
-              echo "::error::Missing asset ${f}"
+            if ! awk -F'\t' -v f="${f}" '$2 == f && $3 == "uploaded" && $4 > 0 { found = 1 } END { exit !found }' "${work}/assets.tsv"; then
+              echo "::error::Missing or incomplete asset ${f}"
               missing=1
             fi
           done
           if [ "${missing}" -ne 0 ]; then exit 1; fi
-          while read -r aid name; do
+          while IFS=$'\t' read -r aid name state size; do
             [ -z "${aid}" ] && continue
             keep=0
             for f in "${expected[@]}"; do [ "${name}" = "${f}" ] && keep=1; done
             if [ "${keep}" -eq 0 ]; then
               echo "Removing extra asset ${name}"
-              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${aid}"
+              gh api -X DELETE "repos/${R}/releases/assets/${aid}"
             fi
-          done <<< "${assets}"
-          gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/${ID}" -F draft=false -f make_latest=true --jq '.html_url'
+          done < "${work}/assets.tsv"
+          jq -er '.plugins.updater.pubkey' src-tauri/tauri.conf.json | base64 --decode > "${work}/updater.pub"
+          fetch() {
+            local aid
+            aid="$(awk -F'\t' -v f="$1" '$2 == f { print $1; exit }' "${work}/assets.tsv")"
+            curl -fsSL --retry 5 --retry-all-errors \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/octet-stream" \
+              -o "${work}/$1" \
+              "https://api.github.com/repos/${R}/releases/assets/${aid}"
+          }
+          for f in "${updaters[@]}"; do
+            fetch "${f}"
+            fetch "${f}.sig"
+            base64 --decode "${work}/${f}.sig" > "${work}/${f}.minisig"
+            minisign -V -p "${work}/updater.pub" -m "${work}/${f}" -x "${work}/${f}.minisig"
+          done
+          base="https://github.com/${R}/releases/download/${TAG}"
+          jq -n \
+            --arg version "${V}" \
+            --arg notes "https://github.com/${R}/releases/tag/${TAG}" \
+            --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg nvidia_url "${base}/${nvidia}" --rawfile nvidia_sig "${work}/${nvidia}.sig" \
+            --arg cpu_url "${base}/${cpu}" --rawfile cpu_sig "${work}/${cpu}.sig" \
+            --arg mac_url "${base}/${mac}" --rawfile mac_sig "${work}/${mac}.sig" \
+            '{version: $version, notes: $notes, pub_date: $date, platforms: {
+              "windows-x86_64-nvidia": {signature: ($nvidia_sig | rtrimstr("\n")), url: $nvidia_url},
+              "windows-x86_64-cpu": {signature: ($cpu_sig | rtrimstr("\n")), url: $cpu_url},
+              "darwin-aarch64": {signature: ($mac_sig | rtrimstr("\n")), url: $mac_url}
+            }}' > "${work}/latest.json"
+          jq -e --arg v "${V}" '.version == $v and (.platforms | length) == 3 and ([.platforms[] | ((.signature | length) > 0) and (.url | startswith("https://github.com/"))] | all)' "${work}/latest.json" > /dev/null
+          cat "${work}/latest.json"
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            --data-binary @"${work}/latest.json" \
+            "https://uploads.github.com/repos/${R}/releases/${ID}/assets?name=latest.json" > "${work}/upload.json"
+          jq -e '.name == "latest.json" and .state == "uploaded" and .size > 0' "${work}/upload.json" > /dev/null
+          gh api -X PATCH "repos/${R}/releases/${ID}" -F draft=false -f make_latest=true --jq '.html_url'

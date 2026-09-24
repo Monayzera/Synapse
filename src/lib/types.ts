@@ -53,6 +53,47 @@ export interface Settings {
   paste_delay_ms: number;
   prefer_gpu: boolean;
   ui_language: UiLanguage;
+  auto_update: boolean;
+}
+
+export type UpdatePhase =
+  | "unsupported"
+  | "idle"
+  | "checking"
+  | "up_to_date"
+  | "available"
+  | "downloading"
+  | "ready"
+  | "installing"
+  | "error";
+
+export interface UpdateStatus {
+  phase: UpdatePhase;
+  current_version: string;
+  version: string | null;
+  downloaded: number;
+  total: number;
+  error: string | null;
+  detail: string | null;
+  last_checked: number | null;
+  blocked: boolean;
+}
+
+export type UpdateNoticeKind =
+  | "installing"
+  | "installed"
+  | "up_to_date"
+  | "downloading"
+  | "available"
+  | "failed"
+  | "check_failed"
+  | "postponed"
+  | "busy"
+  | "relocate";
+
+export interface UpdateNotice {
+  kind: UpdateNoticeKind;
+  version: string | null;
 }
 
 export interface StatusPayload {

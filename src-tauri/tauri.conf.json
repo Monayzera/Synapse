@@ -99,5 +99,16 @@
         "languages": ["English", "PortugueseBR"]
       }
     }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDFFRjJCMEFGMjNGMzRDQzUKUldURlRQTWpyN0R5SHM3M3ovQ24xbUNFOXUxZHJxb1BnaE1GMzhnV3Azc0l4ZjBMaXVxQWdSQ0IK",
+      "endpoints": [
+        "https://github.com/Monayzera/Synapse/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

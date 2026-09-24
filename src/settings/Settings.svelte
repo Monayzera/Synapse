@@ -146,7 +146,7 @@
             {:else if app.section === "advanced"}
               <AdvancedSection {s} />
             {:else}
-              <AboutSection />
+              <AboutSection {s} />
             {/if}
           </div>
         {/key}

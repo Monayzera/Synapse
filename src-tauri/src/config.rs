@@ -83,6 +83,7 @@ pub struct Settings {
     pub paste_delay_ms: u64,
     pub prefer_gpu: bool,
     pub ui_language: String,
+    pub auto_update: bool,
     #[serde(skip)]
     pub transient_unreadable: bool,
 }
@@ -125,6 +126,7 @@ impl Default for Settings {
             paste_delay_ms: 120,
             prefer_gpu: true,
             ui_language: "auto".to_string(),
+            auto_update: true,
             transient_unreadable: false,
         }
     }
@@ -513,6 +515,17 @@ mod tests {
         assert_eq!(merged.ui_language, "pt");
         assert!(!merged.transient_unreadable);
         assert_eq!(merged.hotkey_ptt, base.hotkey_ptt);
+    }
+
+    #[test]
+    fn auto_update_defaults_on_and_follows_patches() {
+        let (legacy, _) = parse_settings(r#"{"ui_language":"pt"}"#).unwrap();
+        assert!(legacy.auto_update);
+        let patch = serde_json::json!({ "auto_update": false });
+        let merged = legacy.merged_with(patch.as_object().unwrap()).unwrap();
+        assert!(!merged.auto_update);
+        let bad = serde_json::json!({ "auto_update": "no" });
+        assert!(legacy.merged_with(bad.as_object().unwrap()).is_err());
     }
 
     #[test]

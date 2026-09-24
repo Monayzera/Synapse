@@ -9,6 +9,7 @@ import type {
   LlamaSetupProgress,
   AutostartStatus,
   SectionId,
+  UpdateStatus,
 } from "../lib/types";
 import { tOr, locale } from "../lib/i18n.svelte";
 
@@ -62,6 +63,7 @@ const DEFAULTS: Settings = {
   paste_delay_ms: 120,
   prefer_gpu: true,
   ui_language: "auto",
+  auto_update: true,
 };
 
 type SaveState = "idle" | "saved" | "error";
@@ -79,6 +81,7 @@ export const app = $state({
   llamaProgress: null as LlamaSetupProgress | null,
   llamaRunning: false,
   autostart: null as AutostartStatus | null,
+  update: null as UpdateStatus | null,
   save: "idle" as SaveState,
   savePulse: 0,
   saveError: "",
@@ -270,6 +273,44 @@ export function refreshStatus() {
     .catch(() => {});
 }
 
+let updateSeq = 0;
+
+function adoptUpdate(u: unknown) {
+  if (!u || typeof u !== "object") return;
+  updateSeq++;
+  app.update = u as UpdateStatus;
+}
+
+export function refreshUpdate() {
+  const seq = updateSeq;
+  api
+    .updateStatus()
+    .then((u) => {
+      if (seq === updateSeq) adoptUpdate(u);
+    })
+    .catch(() => {});
+}
+
+export async function checkUpdate(): Promise<void> {
+  try {
+    await api.checkUpdate();
+  } catch {
+    refreshUpdate();
+  }
+}
+
+export async function installUpdate(): Promise<string | null> {
+  await flush();
+  if (hasPending()) return "settings_unsaved";
+  try {
+    await api.installUpdate();
+    return null;
+  } catch (e) {
+    refreshUpdate();
+    return describeError(e).trim() || "error";
+  }
+}
+
 export function adoptSettings(raw: unknown) {
   applyRemote(raw, true);
 }
@@ -355,6 +396,7 @@ export function start(): () => void {
     refreshDevices();
     refreshStatus();
     refreshLlama();
+    refreshUpdate();
   };
   window.addEventListener("blur", onBlur);
   window.addEventListener("pagehide", onBlur);
@@ -401,6 +443,7 @@ export function start(): () => void {
         refreshModels();
         refreshLlama();
       }),
+      on<UpdateStatus>("update-status", (e) => adoptUpdate(e.payload)),
     ]);
     for (const r of results) {
       if (r.status !== "fulfilled") continue;
@@ -422,6 +465,7 @@ export function start(): () => void {
     refreshLlama();
     refreshAutostart();
     refreshStatus();
+    refreshUpdate();
     api
       .hardwareInfo()
       .then((h) => {
