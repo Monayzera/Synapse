@@ -1,11 +1,13 @@
 @echo off
-setlocal
+setlocal EnableExtensions DisableDelayedExpansion
 
 echo ============================================
 echo  Synapse - Windows Setup
 echo ============================================
 echo.
 
+where winget >nul 2>&1
+if errorlevel 1 if exist "%LOCALAPPDATA%\Microsoft\WindowsApps\winget.exe" set "PATH=%LOCALAPPDATA%\Microsoft\WindowsApps;%PATH%"
 where winget >nul 2>&1
 if errorlevel 1 (
     echo ERRO: winget nao encontrado. Instale o "App Installer" pela Microsoft Store e rode novamente.
@@ -20,11 +22,17 @@ if errorlevel 1 (
     echo.
 )
 
-set "CUDA_CHOICE="
-echo Quer instalar o CUDA Toolkit? Necessario apenas para build com GPU NVIDIA, ~3GB.
-echo   1 - yes
-echo   2 - no
-set /p CUDA_CHOICE="Escolha [1/2]: "
+set "CUDA_CHOICE=2"
+where nvidia-smi >nul 2>&1
+if errorlevel 1 (
+    echo GPU NVIDIA nao detectada: CUDA Toolkit sera pulado. O app funciona na CPU e via API.
+) else (
+    echo Quer instalar o CUDA Toolkit? Opcional: so acelera o Whisper local na GPU NVIDIA, ~3GB.
+    echo   1 - sim
+    echo   2 - nao [padrao]
+    set /p CUDA_CHOICE="Escolha [1/2]: "
+)
+set "CUDA_CHOICE=%CUDA_CHOICE:"=%"
 echo.
 
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -35,17 +43,17 @@ if exist "%VSWHERE%" (
 
 echo [1/6] Visual Studio 2022 Build Tools - MSVC C++ e Windows SDK
 if defined VSPATH (
-    echo     ja instalado: %VSPATH%
+    echo     ja instalado: "%VSPATH%"
 ) else (
     echo     instalando... pode demorar varios minutos.
-    winget install --id Microsoft.VisualStudio.2022.BuildTools -e --accept-source-agreements --accept-package-agreements --override "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+    winget install --id Microsoft.VisualStudio.2022.BuildTools -e --source winget --accept-source-agreements --accept-package-agreements --override "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
     if errorlevel 1 echo     AVISO: winget falhou no Build Tools.
 )
 echo.
 
 echo [2/6] Rust - rustup + toolchain stable-msvc
 if exist "%USERPROFILE%\.cargo\bin\cargo.exe" (
-    echo     ja instalado: %USERPROFILE%\.cargo\bin\cargo.exe
+    echo     ja instalado: "%USERPROFILE%\.cargo\bin\cargo.exe"
 ) else (
     echo     baixando rustup-init.exe...
     curl -fsSL -o "%TEMP%\rustup-init.exe" https://win.rustup.rs/x86_64
@@ -62,9 +70,9 @@ echo.
 
 echo [3/6] LLVM - libclang
 if exist "%ProgramFiles%\LLVM\bin\clang.exe" (
-    echo     ja instalado: %ProgramFiles%\LLVM\bin
+    echo     ja instalado: "%ProgramFiles%\LLVM\bin"
 ) else (
-    winget install --id LLVM.LLVM -e --accept-source-agreements --accept-package-agreements
+    winget install --id LLVM.LLVM -e --source winget --accept-source-agreements --accept-package-agreements
     if errorlevel 1 echo     AVISO: winget falhou no LLVM.
 )
 echo.
@@ -79,7 +87,7 @@ if not defined CMAKE_EXE (
 if defined CMAKE_EXE (
     echo     ja instalado.
 ) else (
-    winget install --id Kitware.CMake -e --accept-source-agreements --accept-package-agreements
+    winget install --id Kitware.CMake -e --source winget --accept-source-agreements --accept-package-agreements
     if errorlevel 1 echo     AVISO: winget falhou no CMake.
 )
 echo.
@@ -94,7 +102,7 @@ if not defined NODE_EXE (
 if defined NODE_EXE (
     echo     ja instalado.
 ) else (
-    winget install --id OpenJS.NodeJS.LTS -e --accept-source-agreements --accept-package-agreements
+    winget install --id OpenJS.NodeJS.LTS -e --source winget --accept-source-agreements --accept-package-agreements
     if errorlevel 1 echo     AVISO: winget falhou no Node.js.
 )
 set "PATH=%ProgramFiles%\nodejs;%PATH%"
@@ -105,13 +113,16 @@ if "%CUDA_CHOICE%"=="1" (
     if exist "%ProgramFiles%\NVIDIA GPU Computing Toolkit\CUDA\v*" (
         echo     ja instalado.
     ) else (
-        winget install --id Nvidia.CUDA -e --accept-source-agreements --accept-package-agreements
+        winget install --id Nvidia.CUDA -e --source winget --accept-source-agreements --accept-package-agreements
         if errorlevel 1 echo     AVISO: winget falhou no CUDA.
     )
 ) else (
-    echo     pulado por escolha do usuario.
+    echo     pulado. CUDA e opcional: o app roda na CPU e via API.
 )
 echo.
+
+for /f "usebackq eol=| delims=" %%p in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "[Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')"`) do set "PATH=%%p"
+set "PATH=%USERPROFILE%\.cargo\bin;%ProgramFiles%\nodejs;%PATH%"
 
 echo Instalando dependencias do frontend - npm install
 pushd "%~dp0..\.."
