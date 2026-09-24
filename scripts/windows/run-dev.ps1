@@ -36,8 +36,13 @@ try {
         }
     }
 
-    Write-Host "Iniciando Tauri em modo dev (compila e abre o app)..." -ForegroundColor Cyan
-    npx tauri dev --features cuda
+    if ($env:CUDA_PATH -and (Test-Path $env:CUDA_PATH)) {
+        Write-Host "Iniciando Tauri em modo dev com CUDA (compila e abre o app)..." -ForegroundColor Cyan
+        npx tauri dev --features cuda
+    } else {
+        Write-Host "CUDA Toolkit nao encontrado: iniciando modo dev sem CUDA (Whisper local na CPU, APIs normais)..." -ForegroundColor Yellow
+        npx tauri dev
+    }
     exit $LASTEXITCODE
 } catch {
     Write-Host ""
