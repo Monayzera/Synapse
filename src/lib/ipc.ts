@@ -13,12 +13,14 @@ import type {
   HfFile,
   LlamaStatus,
   HardwareInfo,
+  AutostartStatus,
+  SectionId,
 } from "./types";
 
 export const api = {
   getStatus: () => invoke<StatusPayload>("get_status"),
   getSettings: () => invoke<Settings>("get_settings"),
-  saveSettings: (settings: Settings) => invoke<void>("save_settings", { settings }),
+  updateSettings: (patch: Partial<Settings>) => invoke<Settings>("update_settings", { patch }),
   listAudioDevices: () => invoke<string[]>("list_audio_devices"),
   toggleRecording: () => invoke<void>("toggle_recording"),
   cancelRecording: () => invoke<void>("cancel_recording"),
@@ -33,7 +35,9 @@ export const api = {
   addToDictionary: (phrase: string, replacement: string) =>
     invoke<void>("add_to_dictionary", { phrase, replacement }),
   modelStatuses: () => invoke<ModelStatus[]>("model_statuses"),
-  downloadModel: (id: string) => invoke<void>("download_model", { id }),
+  downloadModel: (id: string, activate: boolean) =>
+    invoke<void>("download_model", { id, activate }),
+  activateModel: (id: string) => invoke<Settings>("activate_model", { id }),
   hfDetect: (url: string) => invoke<HfParse>("hf_detect", { url }),
   hfListFiles: (repo: string) => invoke<HfFile[]>("hf_list_files", { repo }),
   addCustomModel: (
@@ -59,7 +63,10 @@ export const api = {
   reloadEngine: () => invoke<void>("reload_engine"),
   restartLlm: () => invoke<void>("restart_llm"),
   testLlm: () => invoke<string>("test_llm"),
-  setAutostart: (enabled: boolean) => invoke<void>("set_autostart", { enabled }),
+  autostartStatus: () => invoke<AutostartStatus>("autostart_status"),
+  setAutostart: (enabled: boolean) => invoke<AutostartStatus>("set_autostart", { enabled }),
+  openSettings: (section: SectionId | null) =>
+    invoke<void>("open_settings", { section }),
   openWindow: (label: string) => invoke<void>("open_window", { label }),
   hideWindow: (label: string) => invoke<void>("hide_window", { label }),
 };

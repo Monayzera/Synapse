@@ -1,7 +1,9 @@
 use crate::error::{AppError, AppResult};
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+
+const LOG_ROTATE_BYTES: u64 = 5 * 1024 * 1024;
 
 #[cfg(windows)]
 struct JobHandle(windows::Win32::Foundation::HANDLE);
@@ -22,6 +24,7 @@ impl Sidecar {
         port: u16,
         n_gpu_layers: i32,
         ctx_size: u32,
+        log_path: &Path,
     ) -> AppResult<Sidecar> {
         if !exe.exists() {
             return Err(AppError::Llm(format!(
@@ -56,10 +59,28 @@ impl Sidecar {
         }
 
         configure_no_window(&mut command);
+        command.stdin(Stdio::null());
+        match open_log(log_path) {
+            Ok((stdout, stderr)) => {
+                command.stdout(stdout).stderr(stderr);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "llama-server log {} unavailable ({err}); output discarded",
+                    log_path.display()
+                );
+                command.stdout(Stdio::null()).stderr(Stdio::null());
+            }
+        }
 
         let child = command
             .spawn()
             .map_err(|e| AppError::Llm(format!("failed to start llama-server: {e}")))?;
+        tracing::info!(
+            "llama-server started (pid {}, port {port}, gpu layers {n_gpu_layers}, log {})",
+            child.id(),
+            log_path.display()
+        );
 
         #[cfg(windows)]
         let job = assign_to_job(&child);
@@ -69,6 +90,23 @@ impl Sidecar {
             #[cfg(windows)]
             job,
         })
+    }
+
+    pub fn is_running(&mut self) -> bool {
+        match self.child.as_mut() {
+            Some(child) => match child.try_wait() {
+                Ok(None) => true,
+                Ok(Some(status)) => {
+                    tracing::warn!("llama-server exited ({status})");
+                    false
+                }
+                Err(err) => {
+                    tracing::debug!("llama-server status unknown: {err}");
+                    true
+                }
+            },
+            None => false,
+        }
     }
 
     pub fn stop(&mut self) {
@@ -91,22 +129,58 @@ impl Drop for Sidecar {
     }
 }
 
-pub async fn wait_until_ready(client: &reqwest::Client, port: u16, timeout: Duration) -> bool {
+pub async fn health_ok(client: &reqwest::Client, port: u16) -> bool {
     let url = format!("http://127.0.0.1:{port}/health");
+    matches!(
+        tokio::time::timeout(Duration::from_secs(2), client.get(&url).send()).await,
+        Ok(Ok(response)) if response.status().is_success()
+    )
+}
+
+pub async fn wait_until_ready<F>(
+    client: &reqwest::Client,
+    port: u16,
+    timeout: Duration,
+    mut alive: F,
+) -> bool
+where
+    F: FnMut() -> bool,
+{
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if let Ok(Ok(response)) =
-            tokio::time::timeout(Duration::from_secs(2), client.get(&url).send()).await
-        {
-            if response.status().is_success() {
-                return true;
-            }
+        if !alive() {
+            tracing::warn!("llama-server exited while starting");
+            return false;
+        }
+        if health_ok(client, port).await {
+            return true;
         }
         if tokio::time::Instant::now() >= deadline {
             return false;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+fn open_log(path: &Path) -> std::io::Result<(std::fs::File, std::fs::File)> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > LOG_ROTATE_BYTES {
+            let rotated = path.with_extension("1.log");
+            let _ = std::fs::remove_file(&rotated);
+            if let Err(err) = std::fs::rename(path, &rotated) {
+                tracing::debug!("llama-server log rotation failed: {err}");
+            }
+        }
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let clone = file.try_clone()?;
+    Ok((file, clone))
 }
 
 fn threads() -> usize {

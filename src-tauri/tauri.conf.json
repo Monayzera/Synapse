@@ -15,6 +15,7 @@
     "windows": [
       {
         "label": "widget",
+        "create": false,
         "url": "index.html",
         "title": "Synapse",
         "width": 320,
@@ -33,6 +34,7 @@
       },
       {
         "label": "settings",
+        "create": false,
         "url": "settings.html",
         "title": "Synapse - Ajustes",
         "width": 840,
@@ -47,6 +49,7 @@
       },
       {
         "label": "history",
+        "create": false,
         "url": "history.html",
         "title": "Synapse - Historico",
         "width": 880,

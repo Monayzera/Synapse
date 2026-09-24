@@ -84,6 +84,7 @@ pub struct Cleaned {
     pub text: String,
     pub applied: bool,
     pub error: Option<String>,
+    pub timed_out: bool,
 }
 
 impl Cleaned {
@@ -92,6 +93,7 @@ impl Cleaned {
             text: raw.to_string(),
             applied: false,
             error: None,
+            timed_out: false,
         }
     }
 
@@ -100,6 +102,16 @@ impl Cleaned {
             text: raw.to_string(),
             applied: false,
             error: Some(error),
+            timed_out: false,
+        }
+    }
+
+    fn timed_out(raw: &str) -> Cleaned {
+        Cleaned {
+            text: raw.to_string(),
+            applied: false,
+            error: Some("the AI request timed out".to_string()),
+            timed_out: true,
         }
     }
 }
@@ -173,6 +185,7 @@ impl LlmClient {
                         text: strip_dashes(&sanitize(trimmed), dash_sep),
                         applied: true,
                         error: None,
+                        timed_out: false,
                     }
                 }
             }
@@ -182,7 +195,7 @@ impl LlmClient {
             }
             Err(_) => {
                 tracing::warn!("llm cleanup timed out; using raw text");
-                Cleaned::failed(raw, "the AI request timed out".to_string())
+                Cleaned::timed_out(raw)
             }
         }
     }
@@ -192,11 +205,7 @@ impl LlmClient {
         match settings.llm_backend {
             LlmBackend::Anthropic => self.anthropic(settings, system, &fenced).await,
             LlmBackend::Groq => {
-                let key = if settings.groq_reuse_transcription_key {
-                    settings.groq_api_key.trim()
-                } else {
-                    settings.llm_api_key.trim()
-                };
+                let key = settings.groq_llm_api_key.trim();
                 let model = settings.groq_llm_model.trim();
                 let max_tokens = groq_max_tokens(model, system, &fenced);
                 self.openai_chat(

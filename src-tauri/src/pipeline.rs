@@ -1,13 +1,17 @@
-use crate::config::TranscriptionBackend;
+use crate::config::{LlmBackend, Settings, TranscriptionBackend};
 use crate::error::{AppError, AppResult};
-use crate::state::{AppState, SharedState, Status};
+use crate::state::{AppState, LlmState, SharedState, Status};
 use crate::{dictionary, history, inject};
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 
 pub static CANCEL: AtomicBool = AtomicBool::new(false);
+static RECORDING_GEN: AtomicU64 = AtomicU64::new(0);
+
+const MAX_RECORDING: Duration = Duration::from_secs(600);
+const LOCAL_LLM_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Serialize, Clone)]
 struct CompletePayload {
@@ -22,11 +26,29 @@ struct CompletePayload {
 #[derive(Serialize, Clone)]
 struct PipelineError {
     stage: String,
+    code: String,
     message: String,
+}
+
+pub fn emit_error(app: &AppHandle, stage: &str, code: &str, message: &str) {
+    tracing::info!("pipeline-error [{stage}/{code}]: {message}");
+    let payload = PipelineError {
+        stage: stage.to_string(),
+        code: code.to_string(),
+        message: message.to_string(),
+    };
+    if let Err(err) = app.emit("pipeline-error", payload) {
+        tracing::warn!("pipeline-error emit failed: {err}");
+    }
+}
+
+fn busy_error(app: &AppHandle) {
+    emit_error(app, "busy", "busy", "Still processing the previous dictation.");
 }
 
 pub fn begin_recording(state: &SharedState) {
     if state.busy.load(Ordering::Acquire) {
+        busy_error(&state.app);
         return;
     }
     if state.recording.swap(true, Ordering::AcqRel) {
@@ -34,14 +56,18 @@ pub fn begin_recording(state: &SharedState) {
     }
     if state.busy.load(Ordering::Acquire) {
         state.recording.store(false, Ordering::Release);
+        busy_error(&state.app);
         return;
     }
     CANCEL.store(false, Ordering::Release);
     let backend = state.settings.read().transcription_backend;
-    let not_ready = match backend {
+    let not_ready: Option<(&str, String)> = match backend {
         TranscriptionBackend::Groq => {
             if state.settings.read().groq_api_key.trim().is_empty() {
-                Some("Groq API key not set. Open Settings to add it.".to_string())
+                Some((
+                    "groq_key_missing",
+                    "Groq API key not set. Open Settings to add it.".to_string(),
+                ))
             } else {
                 None
             }
@@ -50,31 +76,65 @@ pub fn begin_recording(state: &SharedState) {
             let meta = state.engine_meta.read();
             if meta.ready {
                 None
+            } else if meta.missing {
+                Some((
+                    "model_missing",
+                    "Voice model not downloaded. Open Settings to download it.".to_string(),
+                ))
+            } else if let Some(other) = meta.error.as_deref() {
+                Some(("engine_error", format!("Voice model failure: {other}")))
             } else {
-                Some(match meta.error.as_deref() {
-                    Some("model not downloaded") => {
-                        "Voice model not downloaded. Open Settings to download it.".to_string()
-                    }
-                    Some(other) => format!("Voice model failure: {other}"),
-                    None => "The voice model is still loading, please wait.".to_string(),
-                })
+                Some((
+                    "engine_loading",
+                    "The voice model is still loading, please wait.".to_string(),
+                ))
             }
         }
     };
-    if let Some(message) = not_ready {
+    if let Some((code, message)) = not_ready {
         state.recording.store(false, Ordering::Release);
-        let _ = state.app.emit(
-            "pipeline-error",
-            PipelineError {
-                stage: "engine".to_string(),
-                message,
-            },
+        emit_error(&state.app, "engine", code, &message);
+        return;
+    }
+    if !state.audio.is_available() {
+        state.recording.store(false, Ordering::Release);
+        state.audio.refresh();
+        emit_error(
+            &state.app,
+            "audio",
+            "mic_unavailable",
+            "No working microphone was found; retrying automatically.",
         );
         return;
     }
     crate::sound::play(true);
     state.audio.start();
     state.set_status(Status::Recording);
+    arm_max_duration(state);
+}
+
+fn arm_max_duration(state: &SharedState) {
+    let generation = RECORDING_GEN.fetch_add(1, Ordering::AcqRel) + 1;
+    let state = state.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(MAX_RECORDING).await;
+        if RECORDING_GEN.load(Ordering::Acquire) != generation
+            || !state.recording.load(Ordering::Acquire)
+        {
+            return;
+        }
+        tracing::warn!(
+            "recording reached the maximum of {} s; stopping it",
+            MAX_RECORDING.as_secs()
+        );
+        emit_error(
+            &state.app,
+            "recording",
+            "max_duration",
+            "Recording stopped automatically at the maximum duration.",
+        );
+        finish_recording(state.app.clone(), state.clone());
+    });
 }
 
 pub fn cancel_recording(state: &SharedState) {
@@ -92,13 +152,7 @@ pub fn finish_recording(app: AppHandle, state: SharedState) {
     crate::sound::play(false);
     if state.busy.swap(true, Ordering::AcqRel) {
         let _ = state.audio.stop();
-        let _ = app.emit(
-            "pipeline-error",
-            PipelineError {
-                stage: "busy".to_string(),
-                message: "Still processing the previous dictation.".to_string(),
-            },
-        );
+        busy_error(&app);
         return;
     }
 
@@ -106,19 +160,29 @@ pub fn finish_recording(app: AppHandle, state: SharedState) {
     state.set_status(Status::Processing);
 
     tauri::async_runtime::spawn(async move {
+        let _busy = BusyGuard(state.clone());
         if let Err(err) = run_pipeline(&app, &state, captured).await {
             tracing::error!("pipeline error: {err}");
-            let _ = app.emit(
-                "pipeline-error",
-                PipelineError {
-                    stage: "pipeline".to_string(),
-                    message: err.to_string(),
-                },
-            );
+            emit_error(&app, "pipeline", "transcription_failed", &err.to_string());
         }
-        state.busy.store(false, Ordering::Release);
-        state.set_status(Status::Idle);
     });
+}
+
+struct BusyGuard(SharedState);
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.0.busy.store(false, Ordering::Release);
+        self.0.set_status(Status::Idle);
+    }
+}
+
+pub fn hotkey_toggle(app: AppHandle, state: SharedState) {
+    if state.recording.load(Ordering::Acquire) {
+        finish_recording(app, state);
+    } else {
+        begin_recording(&state);
+    }
 }
 
 pub fn toggle_recording(app: AppHandle, state: SharedState) {
@@ -271,65 +335,51 @@ async fn run_pipeline(
         &settings.dictionary,
     );
 
-    let want_llm = settings.llm_enabled || (settings.translation_enabled && !whisper_translated);
-    let sidecar_present = state.sidecar.lock().is_some();
-    if want_llm
-        && settings.llm_backend == crate::config::LlmBackend::Local
-        && !state.sidecar_ready.load(Ordering::Acquire)
-        && sidecar_present
-    {
-        tracing::info!("waiting for local AI server to finish warming up before cleanup");
-        loop {
-            if state.sidecar_ready.load(Ordering::Acquire) {
-                break;
-            }
-            if state.sidecar_settled.load(Ordering::Acquire) {
-                break;
-            }
-            if CANCEL.load(Ordering::Acquire) {
-                let _ = app.emit("transcription-cancelled", ());
-                return Ok(());
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let wants_translation = settings.translation_enabled && !whisper_translated;
+    let want_llm = settings.llm_enabled || wants_translation;
+    let gate = if want_llm {
+        llm_gate(state, &settings, wants_translation).await
+    } else {
+        LlmGate::Skip(None)
+    };
+    let (final_text, llm_used, llm_issue) = match gate {
+        LlmGate::Cancelled => {
+            let _ = app.emit("transcription-cancelled", ());
+            return Ok(());
         }
-    }
-    let local_not_ready = settings.llm_backend == crate::config::LlmBackend::Local
-        && !state.sidecar_ready.load(Ordering::Acquire);
-    let (final_text, llm_used, llm_error) = if want_llm && !local_not_ready {
-        let eff: std::borrow::Cow<'_, crate::config::Settings> = if whisper_translated {
-            let mut tuned = settings.clone();
-            tuned.translation_enabled = false;
-            std::borrow::Cow::Owned(tuned)
-        } else {
-            std::borrow::Cow::Borrowed(&settings)
-        };
-        let llm_start = std::time::Instant::now();
-        let cleanup = state.llm.cleanup(&*eff, &processed);
-        tokio::pin!(cleanup);
-        let outcome = loop {
-            tokio::select! {
-                out = &mut cleanup => break out,
-                _ = tokio::time::sleep(std::time::Duration::from_millis(120)) => {
-                    if CANCEL.load(Ordering::Acquire) {
-                        let _ = app.emit("transcription-cancelled", ());
-                        return Ok(());
+        LlmGate::Skip(issue) => (processed.clone(), false, issue),
+        LlmGate::Run => {
+            let eff: std::borrow::Cow<'_, Settings> = if whisper_translated {
+                let mut tuned = settings.clone();
+                tuned.translation_enabled = false;
+                std::borrow::Cow::Owned(tuned)
+            } else {
+                std::borrow::Cow::Borrowed(&settings)
+            };
+            let llm_start = std::time::Instant::now();
+            let cleanup = state.llm.cleanup(&eff, &processed);
+            tokio::pin!(cleanup);
+            let outcome = loop {
+                tokio::select! {
+                    out = &mut cleanup => break out,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(120)) => {
+                        if CANCEL.load(Ordering::Acquire) {
+                            let _ = app.emit("transcription-cancelled", ());
+                            return Ok(());
+                        }
                     }
                 }
-            }
-        };
-        tracing::info!("llm cleanup took {} ms", llm_start.elapsed().as_millis());
-        (outcome.text, outcome.applied, outcome.error)
-    } else if want_llm && local_not_ready {
-        tracing::info!("llm skipped: local server not ready");
-        (
-            processed.clone(),
-            false,
-            Some(
-                "AI Correction is set to Local but the local AI server is not running. Switch the AI Correction backend to Groq in Settings, or install a local model.".to_string(),
-            ),
-        )
-    } else {
-        (processed.clone(), false, None)
+            };
+            tracing::info!("llm cleanup took {} ms", llm_start.elapsed().as_millis());
+            let issue = outcome.error.map(|message| {
+                if outcome.timed_out {
+                    ("llm_timeout", message)
+                } else {
+                    ("llm_failed", message)
+                }
+            });
+            (outcome.text, outcome.applied, issue)
+        }
     };
 
     if CANCEL.load(Ordering::Acquire) {
@@ -347,16 +397,18 @@ async fn run_pipeline(
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
             tracing::warn!("injection failed: {err}");
-            let _ = app.emit(
-                "pipeline-error",
-                PipelineError {
-                    stage: "inject".to_string(),
-                    message: format!("{err}. {}", inject_block_hint()),
-                },
+            emit_error(
+                app,
+                "inject",
+                "inject_failed",
+                &format!("{err}. {}", inject_block_hint()),
             );
         }
-        Err(_) => {
-            let _ = inject::copy_to_clipboard(&final_text);
+        Err(join_err) => {
+            tracing::error!("injection task failed: {join_err}");
+            if let Err(err) = inject::copy_to_clipboard(&final_text) {
+                tracing::warn!("clipboard fallback failed: {err}");
+            }
         }
     }
 
@@ -371,7 +423,9 @@ async fn run_pipeline(
         llm_used,
         cloud: matches!(backend, TranscriptionBackend::Groq),
     };
-    let _ = state.db_insert(&entry);
+    if let Err(err) = state.db_insert(&entry) {
+        tracing::warn!("history insert failed: {err}");
+    }
 
     let _ = app.emit(
         "transcription-complete",
@@ -385,22 +439,79 @@ async fn run_pipeline(
         },
     );
 
-    if let Some(message) = llm_error {
-        let stage = if settings.translation_enabled && !whisper_translated {
-            "translation"
-        } else {
-            "ai"
-        };
-        let _ = app.emit(
-            "pipeline-error",
-            PipelineError {
-                stage: stage.to_string(),
-                message,
-            },
-        );
+    if let Some((code, message)) = llm_issue {
+        let stage = if wants_translation { "translation" } else { "ai" };
+        emit_error(app, stage, code, &message);
     }
 
     Ok(())
+}
+
+enum LlmGate {
+    Run,
+    Skip(Option<(&'static str, String)>),
+    Cancelled,
+}
+
+async fn llm_gate(state: &SharedState, settings: &Settings, wants_translation: bool) -> LlmGate {
+    let not_configured = || {
+        if wants_translation {
+            LlmGate::Skip(Some((
+                "llm_not_configured",
+                "Translation needs an AI provider; the text was pasted untranslated.".to_string(),
+            )))
+        } else {
+            LlmGate::Skip(None)
+        }
+    };
+    match settings.llm_backend {
+        LlmBackend::Groq => {
+            if settings.groq_llm_api_key.trim().is_empty() {
+                LlmGate::Skip(Some((
+                    "groq_llm_key_missing",
+                    "Groq AI key not set; the text was pasted without AI.".to_string(),
+                )))
+            } else {
+                LlmGate::Run
+            }
+        }
+        LlmBackend::Local => {
+            let deadline = tokio::time::Instant::now() + LOCAL_LLM_WAIT;
+            loop {
+                match state.local_llm_state() {
+                    LlmState::Ready => return LlmGate::Run,
+                    LlmState::Off => return not_configured(),
+                    LlmState::Failed => {
+                        return LlmGate::Skip(Some((
+                            "llm_failed",
+                            "The local AI server is not running; the text was pasted without AI."
+                                .to_string(),
+                        )))
+                    }
+                    LlmState::Starting => {}
+                }
+                if CANCEL.load(Ordering::Acquire) {
+                    return LlmGate::Cancelled;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    tracing::info!("local AI server still warming up; pasting raw text");
+                    return LlmGate::Skip(Some((
+                        "llm_not_ready",
+                        "The local AI is still starting; the text was pasted without AI."
+                            .to_string(),
+                    )));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        _ => {
+            if settings.llm_endpoint.trim().is_empty() {
+                not_configured()
+            } else {
+                LlmGate::Run
+            }
+        }
+    }
 }
 
 fn maybe_trim(state: &AppState, mono: Vec<f32>) -> Vec<f32> {

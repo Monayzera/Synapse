@@ -5,12 +5,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub fn play(start: bool) {
-    std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("synapse-cue".to_string())
         .spawn(move || {
             let _ = play_tone(start);
-        })
-        .ok();
+        });
+    if let Err(err) = spawned {
+        tracing::warn!("sound cue thread could not start: {err}");
+    }
 }
 
 fn play_tone(start: bool) -> Result<(), ()> {

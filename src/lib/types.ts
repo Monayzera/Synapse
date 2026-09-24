@@ -4,6 +4,12 @@ export type LlmBackend = "local" | "open_ai_compatible" | "anthropic" | "ollama"
 
 export type TranscriptionBackend = "local" | "groq";
 
+export type UiLanguage = "auto" | "pt" | "en";
+
+export type SectionId = "general" | "voice" | "ai" | "dictionary" | "advanced";
+
+export type LlmState = "off" | "starting" | "ready" | "failed";
+
 export type StatusKind =
   | "idle"
   | "recording"
@@ -13,7 +19,6 @@ export type StatusKind =
 
 export interface Settings {
   hotkey_ptt: string;
-  hotkey_toggle: string;
   record_mode: RecordMode;
   language: string;
   whisper_model: string;
@@ -21,7 +26,7 @@ export interface Settings {
   groq_api_key: string;
   groq_model: string;
   groq_llm_model: string;
-  groq_reuse_transcription_key: boolean;
+  groq_llm_api_key: string;
   audio_device: string | null;
   vad_enabled: boolean;
   vad_threshold: number;
@@ -47,6 +52,7 @@ export interface Settings {
   restore_clipboard: boolean;
   paste_delay_ms: number;
   prefer_gpu: boolean;
+  ui_language: UiLanguage;
 }
 
 export interface StatusPayload {
@@ -57,6 +63,17 @@ export interface StatusPayload {
   model: string;
   audio_available: boolean;
   vad_active: boolean;
+  error: string | null;
+  starting: boolean;
+  hotkey_ready: boolean;
+  llm: LlmState;
+  error_code: string | null;
+  autostart_launch: boolean;
+}
+
+export interface AutostartStatus {
+  enabled: boolean;
+  disabled_by_windows: boolean;
   error: string | null;
 }
 
@@ -161,5 +178,6 @@ export interface CompletePayload {
 
 export interface PipelineErrorPayload {
   stage: string;
+  code: string;
   message: string;
 }

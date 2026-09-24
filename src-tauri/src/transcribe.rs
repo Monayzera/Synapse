@@ -7,6 +7,35 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 pub struct TranscribeEngine {
     context: WhisperContext,
     pub on_gpu: bool,
+    pub backend: String,
+}
+
+fn gpu_device_name() -> Option<String> {
+    use whisper_rs::whisper_rs_sys as sys;
+    unsafe {
+        let count = sys::ggml_backend_dev_count();
+        for index in 0..count {
+            let device = sys::ggml_backend_dev_get(index);
+            if device.is_null() {
+                continue;
+            }
+            let kind = sys::ggml_backend_dev_type(device);
+            if kind == sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_GPU
+                || kind == sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_IGPU
+            {
+                let name = sys::ggml_backend_dev_name(device);
+                if name.is_null() {
+                    return Some("GPU".to_string());
+                }
+                return Some(
+                    std::ffi::CStr::from_ptr(name)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+    }
+    None
 }
 
 impl TranscribeEngine {
@@ -15,11 +44,20 @@ impl TranscribeEngine {
         SYSINFO_ONCE.call_once(|| {
             tracing::info!("whisper system_info: {}", whisper_rs::print_system_info());
         });
-        if !model_path.exists() {
-            return Err(AppError::Model(format!(
-                "whisper model not found: {}",
-                model_path.display()
-            )));
+        match model_path.try_exists() {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(AppError::Model(format!(
+                    "whisper model not found: {}",
+                    model_path.display()
+                )))
+            }
+            Err(err) => {
+                return Err(AppError::Io(format!(
+                    "whisper model not accessible: {}: {err}",
+                    model_path.display()
+                )))
+            }
         }
         let path_str = model_path.to_string_lossy().to_string();
 
@@ -27,10 +65,23 @@ impl TranscribeEngine {
         if prefer_gpu && gpu_capable {
             match Self::try_load(&path_str, true) {
                 Ok(context) => {
-                    return Ok(TranscribeEngine {
-                        context,
-                        on_gpu: true,
-                    })
+                    return Ok(match gpu_device_name() {
+                        Some(device) => TranscribeEngine {
+                            context,
+                            on_gpu: true,
+                            backend: format!("GPU ({device})"),
+                        },
+                        None => {
+                            tracing::warn!(
+                                "GPU whisper requested but no GPU device is available; running on CPU"
+                            );
+                            TranscribeEngine {
+                                context,
+                                on_gpu: false,
+                                backend: "CPU".to_string(),
+                            }
+                        }
+                    });
                 }
                 Err(err) => {
                     tracing::warn!("GPU whisper init failed ({err}); falling back to CPU");
@@ -42,6 +93,7 @@ impl TranscribeEngine {
         Ok(TranscribeEngine {
             context,
             on_gpu: false,
+            backend: "CPU".to_string(),
         })
     }
 

@@ -49,7 +49,6 @@ impl Default for TranscriptionBackend {
 #[serde(default)]
 pub struct Settings {
     pub hotkey_ptt: String,
-    pub hotkey_toggle: String,
     pub record_mode: RecordMode,
     pub language: String,
     pub whisper_model: String,
@@ -57,7 +56,7 @@ pub struct Settings {
     pub groq_api_key: String,
     pub groq_model: String,
     pub groq_llm_model: String,
-    pub groq_reuse_transcription_key: bool,
+    pub groq_llm_api_key: String,
     pub audio_device: Option<String>,
     pub vad_enabled: bool,
     pub vad_threshold: f32,
@@ -83,6 +82,7 @@ pub struct Settings {
     pub restore_clipboard: bool,
     pub paste_delay_ms: u64,
     pub prefer_gpu: bool,
+    pub ui_language: String,
     #[serde(skip)]
     pub transient_unreadable: bool,
 }
@@ -91,7 +91,6 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             hotkey_ptt: "Ctrl+Shift+Space".to_string(),
-            hotkey_toggle: "Ctrl+Shift+T".to_string(),
             record_mode: RecordMode::PushToTalk,
             language: "auto".to_string(),
             whisper_model: "large-v3-turbo".to_string(),
@@ -99,7 +98,7 @@ impl Default for Settings {
             groq_api_key: String::new(),
             groq_model: "whisper-large-v3-turbo".to_string(),
             groq_llm_model: "llama-3.1-8b-instant".to_string(),
-            groq_reuse_transcription_key: true,
+            groq_llm_api_key: String::new(),
             audio_device: None,
             vad_enabled: true,
             vad_threshold: 0.5,
@@ -109,7 +108,7 @@ impl Default for Settings {
             filler_words: default_fillers(),
             dictionary: BTreeMap::new(),
             vocabulary: Vec::new(),
-            llm_enabled: true,
+            llm_enabled: false,
             llm_format_paragraphs: false,
             translation_enabled: false,
             translation_target: "English".to_string(),
@@ -125,6 +124,7 @@ impl Default for Settings {
             restore_clipboard: true,
             paste_delay_ms: 120,
             prefer_gpu: true,
+            ui_language: "auto".to_string(),
             transient_unreadable: false,
         }
     }
@@ -140,14 +140,14 @@ fn default_fillers() -> Vec<String> {
 }
 
 pub enum LoadOutcome {
-    Loaded(Box<Settings>),
+    Loaded(Box<Settings>, bool),
     Missing,
     Corrupt,
     Unreadable,
 }
 
 enum ReadResult {
-    Parsed(Box<Settings>),
+    Parsed(Box<Settings>, bool),
     Missing,
     Invalid(String),
     Transient,
@@ -157,14 +157,21 @@ fn path_present(path: &Path) -> bool {
     matches!(path.try_exists(), Ok(true))
 }
 
+fn parse_settings(content: &str) -> Result<(Settings, bool), serde_json::Error> {
+    let raw: serde_json::Value = serde_json::from_str(content)?;
+    let mut settings = Settings::deserialize(&raw)?;
+    let migrated = settings.migrate_legacy(&raw);
+    Ok((settings, migrated))
+}
+
 fn try_read_parse(path: &Path) -> ReadResult {
     match std::fs::read_to_string(path) {
         Ok(content) => {
             if content.trim().is_empty() {
                 ReadResult::Transient
             } else {
-                match serde_json::from_str::<Settings>(&content) {
-                    Ok(settings) => ReadResult::Parsed(Box::new(settings)),
+                match parse_settings(&content) {
+                    Ok((settings, migrated)) => ReadResult::Parsed(Box::new(settings), migrated),
                     Err(err) => {
                         tracing::warn!("settings parse failed: {err}");
                         ReadResult::Invalid(content)
@@ -213,12 +220,12 @@ impl Settings {
         let bak = bak_path(path);
         let bak_budget = budget / 4;
         let primary = read_with_backoff(path, budget - bak_budget);
-        if let ReadResult::Parsed(settings) = primary {
-            return LoadOutcome::Loaded(settings);
+        if let ReadResult::Parsed(settings, migrated) = primary {
+            return LoadOutcome::Loaded(settings, migrated);
         }
-        if let ReadResult::Parsed(settings) = read_with_backoff(&bak, bak_budget) {
+        if let ReadResult::Parsed(settings, migrated) = read_with_backoff(&bak, bak_budget) {
             tracing::warn!("settings.json unusable; recovered from settings.bak");
-            return LoadOutcome::Loaded(settings);
+            return LoadOutcome::Loaded(settings, migrated);
         }
         match primary {
             ReadResult::Invalid(content) => {
@@ -248,6 +255,57 @@ impl Settings {
             tracing::warn!("settings.bak write failed: {err}");
         }
         Ok(())
+    }
+
+    fn migrate_legacy(&mut self, raw: &serde_json::Value) -> bool {
+        if !self.groq_llm_api_key.is_empty() || raw.get("groq_llm_api_key").is_some() {
+            return false;
+        }
+        let reuse = raw
+            .get("groq_reuse_transcription_key")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        if reuse {
+            if self.groq_api_key.is_empty() {
+                return false;
+            }
+            self.groq_llm_api_key = self.groq_api_key.clone();
+            return true;
+        }
+        if self.llm_backend == LlmBackend::Groq && !self.llm_api_key.is_empty() {
+            self.groq_llm_api_key = std::mem::take(&mut self.llm_api_key);
+            return true;
+        }
+        false
+    }
+
+    pub fn merged_with(
+        &self,
+        patch: &serde_json::Map<String, serde_json::Value>,
+    ) -> AppResult<Settings> {
+        let mut value = serde_json::to_value(self)?;
+        let fields = value
+            .as_object_mut()
+            .ok_or_else(|| AppError::Config("settings are not an object".to_string()))?;
+        for (key, entry) in patch {
+            if fields.contains_key(key) {
+                fields.insert(key.clone(), entry.clone());
+            }
+        }
+        let mut merged = Settings::deserialize(&value)
+            .map_err(|err| AppError::Config(format!("invalid settings: {err}")))?;
+        merged.clamp_ranges();
+        merged.transient_unreadable = self.transient_unreadable;
+        Ok(merged)
+    }
+
+    fn clamp_ranges(&mut self) {
+        self.vad_threshold = self.vad_threshold.clamp(0.1, 0.9);
+        self.speech_pad_ms = self.speech_pad_ms.clamp(0, 400);
+        self.min_silence_ms = self.min_silence_ms.clamp(50, 1000);
+        self.paste_delay_ms = self.paste_delay_ms.clamp(40, 1000);
+        self.llm_timeout_ms = self.llm_timeout_ms.clamp(500, 20000);
+        self.llm_temperature = self.llm_temperature.clamp(0.0, 1.0);
     }
 
     pub fn language_code(&self) -> Option<String> {
@@ -305,7 +363,7 @@ mod tests {
         s.llm_format_paragraphs = true;
         s.save(&p).unwrap();
         match Settings::load(&p) {
-            LoadOutcome::Loaded(loaded) => {
+            LoadOutcome::Loaded(loaded, _) => {
                 assert_eq!(loaded.groq_api_key, "gsk_test");
                 assert!(loaded.llm_format_paragraphs);
             }
@@ -338,7 +396,7 @@ mod tests {
         s.save(&p).unwrap();
         std::fs::write(&p, b"garbage").unwrap();
         match Settings::load(&p) {
-            LoadOutcome::Loaded(loaded) => assert_eq!(loaded.groq_api_key, "from_bak"),
+            LoadOutcome::Loaded(loaded, _) => assert_eq!(loaded.groq_api_key, "from_bak"),
             _ => panic!("expected recovery from settings.bak"),
         }
         cleanup(&p);
@@ -366,5 +424,123 @@ mod tests {
         assert!(s.save(&p).is_err());
         assert!(!path_present(&p));
         cleanup(&p);
+    }
+
+    #[test]
+    fn legacy_reuse_copies_voice_key() {
+        let (s, migrated) =
+            parse_settings(r#"{"groq_api_key":"gsk_voice","groq_reuse_transcription_key":true}"#)
+                .unwrap();
+        assert!(migrated);
+        assert_eq!(s.groq_llm_api_key, "gsk_voice");
+        assert_eq!(s.groq_api_key, "gsk_voice");
+    }
+
+    #[test]
+    fn legacy_missing_flag_copies_voice_key() {
+        let (s, migrated) = parse_settings(r#"{"groq_api_key":"gsk_voice"}"#).unwrap();
+        assert!(migrated);
+        assert_eq!(s.groq_llm_api_key, "gsk_voice");
+    }
+
+    #[test]
+    fn legacy_separate_key_moves_llm_key_for_groq_backend() {
+        let (s, migrated) = parse_settings(
+            r#"{"groq_api_key":"gsk_voice","groq_reuse_transcription_key":false,"llm_backend":"groq","llm_api_key":"gsk_ai"}"#,
+        )
+        .unwrap();
+        assert!(migrated);
+        assert_eq!(s.groq_llm_api_key, "gsk_ai");
+        assert_eq!(s.llm_api_key, "");
+        assert_eq!(s.groq_api_key, "gsk_voice");
+    }
+
+    #[test]
+    fn legacy_separate_key_other_backend_keeps_llm_key() {
+        let (s, migrated) = parse_settings(
+            r#"{"groq_api_key":"gsk_voice","groq_reuse_transcription_key":false,"llm_backend":"anthropic","llm_api_key":"sk_other"}"#,
+        )
+        .unwrap();
+        assert!(!migrated);
+        assert_eq!(s.groq_llm_api_key, "");
+        assert_eq!(s.llm_api_key, "sk_other");
+    }
+
+    #[test]
+    fn migration_is_idempotent_after_persist() {
+        let p = tmp_path();
+        std::fs::write(&p, br#"{"groq_api_key":"gsk_voice"}"#).unwrap();
+        let first = match Settings::load(&p) {
+            LoadOutcome::Loaded(loaded, migrated) => {
+                assert!(migrated);
+                *loaded
+            }
+            _ => panic!("expected Loaded"),
+        };
+        first.save(&p).unwrap();
+        match Settings::load(&p) {
+            LoadOutcome::Loaded(loaded, migrated) => {
+                assert!(!migrated);
+                assert_eq!(loaded.groq_llm_api_key, "gsk_voice");
+            }
+            _ => panic!("expected Loaded"),
+        }
+        let mut cleared = first.clone();
+        cleared.groq_llm_api_key.clear();
+        cleared.save(&p).unwrap();
+        match Settings::load(&p) {
+            LoadOutcome::Loaded(loaded, migrated) => {
+                assert!(!migrated);
+                assert_eq!(loaded.groq_llm_api_key, "");
+            }
+            _ => panic!("expected Loaded"),
+        }
+        cleanup(&p);
+    }
+
+    #[test]
+    fn merge_applies_known_keys_and_ignores_unknown() {
+        let base = Settings::default();
+        let patch = serde_json::json!({
+            "llm_enabled": true,
+            "ui_language": "pt",
+            "hotkey_toggle": "Ctrl+Shift+T",
+            "transient_unreadable": true,
+            "not_a_field": 5
+        });
+        let merged = base.merged_with(patch.as_object().unwrap()).unwrap();
+        assert!(merged.llm_enabled);
+        assert_eq!(merged.ui_language, "pt");
+        assert!(!merged.transient_unreadable);
+        assert_eq!(merged.hotkey_ptt, base.hotkey_ptt);
+    }
+
+    #[test]
+    fn merge_rejects_invalid_types() {
+        let base = Settings::default();
+        let patch = serde_json::json!({ "vad_enabled": "yes" });
+        assert!(base.merged_with(patch.as_object().unwrap()).is_err());
+        let patch = serde_json::json!({ "record_mode": "hold" });
+        assert!(base.merged_with(patch.as_object().unwrap()).is_err());
+    }
+
+    #[test]
+    fn merge_clamps_numeric_ranges() {
+        let base = Settings::default();
+        let patch = serde_json::json!({
+            "vad_threshold": 2.0,
+            "speech_pad_ms": 900,
+            "min_silence_ms": 1,
+            "paste_delay_ms": 5000,
+            "llm_timeout_ms": 10,
+            "llm_temperature": -3.0
+        });
+        let merged = base.merged_with(patch.as_object().unwrap()).unwrap();
+        assert!((merged.vad_threshold - 0.9).abs() < f32::EPSILON);
+        assert_eq!(merged.speech_pad_ms, 400);
+        assert_eq!(merged.min_silence_ms, 50);
+        assert_eq!(merged.paste_delay_ms, 1000);
+        assert_eq!(merged.llm_timeout_ms, 500);
+        assert!(merged.llm_temperature.abs() < f32::EPSILON);
     }
 }

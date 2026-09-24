@@ -3,8 +3,15 @@
   import { api, on, getCurrentWindow, type UnlistenFn } from "../lib/ipc";
   import { currentMonitor } from "@tauri-apps/api/window";
   import { LogicalPosition, LogicalSize } from "@tauri-apps/api/dpi";
-  import type { StatusPayload, CompletePayload, PipelineErrorPayload } from "../lib/types";
+  import type {
+    StatusPayload,
+    CompletePayload,
+    PipelineErrorPayload,
+    SectionId,
+    Settings,
+  } from "../lib/types";
   import Icon from "../lib/Icon.svelte";
+  import { t, tOr, setLanguage } from "../lib/i18n.svelte";
 
   const BAR_COUNT = 18;
   const PILL_HALF = 75;
@@ -14,7 +21,7 @@
   const WINDOW_EXTRA = 170;
   const WINDOW_HEIGHT = 40;
 
-  let status = $state<StatusPayload>({
+  const INITIAL_STATUS: StatusPayload = {
     status: "idle",
     recording: false,
     cpu_mode: false,
@@ -23,7 +30,14 @@
     audio_available: true,
     vad_active: false,
     error: null,
-  });
+    starting: true,
+    hotkey_ready: true,
+    llm: "off",
+    error_code: null,
+    autostart_launch: false,
+  };
+
+  let status = $state<StatusPayload>({ ...INITIAL_STATUS });
 
   let levels = $state<number[]>(Array(BAR_COUNT).fill(0));
   let flash = $state<{ text: string; kind: "ok" | "err" } | null>(null);
@@ -39,8 +53,10 @@
   let resizeSeq = 0;
   let shrinkTimer: ReturnType<typeof setTimeout> | undefined;
 
+  const mode = $derived(status.status);
+
   $effect(() => {
-    if (status.status === "processing") {
+    if (mode === "processing") {
       if (!procTimer) {
         procStart = Date.now();
         elapsed = 0;
@@ -63,19 +79,34 @@
   });
 
   const procLabel = $derived.by(() => {
-    if (cancelling) return "Cancelling…";
-    if (elapsed >= 20) return `Taking long ${elapsed}s`;
-    if (elapsed >= 1) return `Transcribing ${elapsed}s`;
-    return "Transcribing…";
+    if (cancelling) return t("w.cancelling");
+    if (elapsed >= 20) return t("w.takingLong", { s: elapsed });
+    if (elapsed >= 1) return t("w.transcribingS", { s: elapsed });
+    return t("w.transcribing");
   });
 
-  const idleText = $derived.by(() => {
-    if (!status.audio_available) return "No microphone";
-    if (status.status === "loading") return "Loading…";
-    if (status.status === "error") return "Model error";
-    if (!status.engine_ready) return "Download the model";
-    return "Synapse";
+  const idle = $derived.by((): { text: string; section: SectionId | null; dim: boolean } => {
+    if (status.starting) return { text: t("w.starting"), section: null, dim: true };
+    if (!status.audio_available) return { text: t("w.noMic"), section: "general", dim: true };
+    if (!status.engine_ready) {
+      if (status.status === "loading" || status.error_code === "engine_loading") {
+        return { text: t("w.loading"), section: null, dim: true };
+      }
+      if (status.error_code === "model_missing") {
+        return { text: t("w.downloadModel"), section: "voice", dim: true };
+      }
+      if (status.status === "error" || status.error_code === "engine_error") {
+        return { text: t("w.modelError"), section: "voice", dim: true };
+      }
+      return { text: t("w.downloadModel"), section: "voice", dim: true };
+    }
+    if (status.hotkey_ready === false) {
+      return { text: t("w.hotkeyUnavailable"), section: null, dim: true };
+    }
+    return { text: "Synapse", section: null, dim: false };
   });
+
+  const idleText = $derived(idle.text);
 
   function showFlash(text: string, kind: "ok" | "err") {
     if (!text) return;
@@ -177,61 +208,138 @@
     } catch (_) {}
   }
 
+  function applyStatus(payload: unknown) {
+    if (!payload || typeof payload !== "object") return;
+    const was = status.status;
+    status = { ...INITIAL_STATUS, starting: false, ...(payload as Partial<StatusPayload>) };
+    if (status.status === "recording" && was !== "recording") resetLevels();
+  }
+
+  function pipelineErrorText(payload: PipelineErrorPayload | string | null | undefined): string {
+    if (typeof payload === "string") return tOr("err." + payload, payload);
+    if (!payload || typeof payload !== "object") return "";
+    const message = typeof payload.message === "string" ? payload.message : "";
+    const code = typeof payload.code === "string" ? payload.code : "";
+    if (code) return tOr("err." + code, message || code);
+    return message;
+  }
+
+  function openSection(section: SectionId) {
+    api.openSettings(section).catch(() => {
+      api.openWindow("settings").catch(() => {});
+    });
+  }
+
   onMount(() => {
-    let unlisten: UnlistenFn[] = [];
+    let disposed = false;
+    let statusSeq = 0;
+    let gapTimer: ReturnType<typeof setTimeout> | undefined;
+    let pollTimer: ReturnType<typeof setInterval> | undefined;
+    const unlisten: UnlistenFn[] = [];
+    const win = getCurrentWindow();
+
     const clearHover = () => (hovered = false);
+
+    async function fetchStatus(): Promise<boolean> {
+      const seq = statusSeq;
+      try {
+        const next = await api.getStatus();
+        if (!disposed && seq === statusSeq) applyStatus(next);
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function onStatusEvent(payload: unknown) {
+      statusSeq++;
+      applyStatus(payload);
+      clearTimeout(gapTimer);
+      gapTimer = setTimeout(() => {
+        void fetchStatus();
+      }, 1500);
+    }
+
+    const onFocus = () => {
+      void fetchStatus();
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") void fetchStatus();
+    };
+
     window.addEventListener("blur", clearHover);
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibility);
+
     (async () => {
-      for (let attempt = 0; attempt < 40; attempt++) {
-        try {
-          status = await api.getStatus();
-          return;
-        } catch (_) {
-          await new Promise((r) => setTimeout(r, Math.min(1500, 200 + attempt * 100)));
+      const results = await Promise.allSettled([
+        on<StatusPayload>("status-changed", (e) => onStatusEvent(e.payload)),
+        on<number>("audio-level", (e) => {
+          if (typeof e.payload === "number") pushLevel(e.payload);
+        }),
+        on<CompletePayload>("transcription-complete", (e) =>
+          showFlash(typeof e.payload?.final_text === "string" ? e.payload.final_text : "", "ok"),
+        ),
+        on<PipelineErrorPayload | string>("pipeline-error", (e) =>
+          showFlash(pipelineErrorText(e.payload), "err"),
+        ),
+        on("transcription-empty", () => showFlash(t("w.noSpeech"), "err")),
+        on("transcription-cancelled", () => showFlash(t("w.cancelled"), "err")),
+        on<Settings>("settings-changed", (e) => {
+          if (e.payload && typeof e.payload === "object") setLanguage(e.payload.ui_language);
+        }),
+        win.onMoved(() => {
+          hovered = false;
+          updateDockSide();
+        }),
+        win.onResized(() => updateDockSide()),
+        win.onScaleChanged(() => updateDockSide()),
+      ]);
+      for (const r of results) {
+        if (r.status !== "fulfilled") continue;
+        if (disposed) {
+          try {
+            r.value();
+          } catch (_) {}
+        } else {
+          unlisten.push(r.value);
         }
       }
-    })();
+      if (disposed) return;
+      for (let attempt = 0; attempt < 40 && !disposed; attempt++) {
+        if (await fetchStatus()) break;
+        await new Promise((r) => setTimeout(r, Math.min(1500, 200 + attempt * 100)));
+      }
+      if (disposed) return;
+      pollTimer = setInterval(() => {
+        if (status.starting) void fetchStatus();
+      }, 2000);
+      for (let attempt = 0; attempt < 20 && !disposed; attempt++) {
+        try {
+          const s = await api.getSettings();
+          if (!disposed && s && typeof s === "object") setLanguage(s.ui_language);
+          break;
+        } catch (_) {
+          await new Promise((r) => setTimeout(r, Math.min(2000, 300 + attempt * 200)));
+        }
+      }
+    })().catch(() => {});
+
     updateDockSide();
-    (async () => {
-      try {
-        unlisten.push(
-          await getCurrentWindow().onMoved(() => {
-            hovered = false;
-            updateDockSide();
-          }),
-        );
-        unlisten.push(await getCurrentWindow().onResized(() => updateDockSide()));
-        unlisten.push(await getCurrentWindow().onScaleChanged(() => updateDockSide()));
-        unlisten.push(
-          await on<StatusPayload>("status-changed", (e) => {
-            const was = status.status;
-            status = e.payload;
-            if (status.status === "recording" && was !== "recording") resetLevels();
-          }),
-        );
-        unlisten.push(await on<number>("audio-level", (e) => pushLevel(e.payload)));
-        unlisten.push(
-          await on<CompletePayload>("transcription-complete", (e) =>
-            showFlash(e.payload.final_text, "ok"),
-          ),
-        );
-        unlisten.push(
-          await on<PipelineErrorPayload | string>("pipeline-error", (e) =>
-            showFlash(typeof e.payload === "string" ? e.payload : e.payload.message, "err"),
-          ),
-        );
-        unlisten.push(
-          await on("transcription-empty", () => showFlash("No speech detected", "err")),
-        );
-        unlisten.push(
-          await on("transcription-cancelled", () => showFlash("Cancelled", "err")),
-        );
-      } catch (_) {}
-    })();
+
     return () => {
+      disposed = true;
       clearTimeout(flashTimer);
+      clearTimeout(gapTimer);
+      clearInterval(pollTimer);
       window.removeEventListener("blur", clearHover);
-      unlisten.forEach((u) => u());
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
+      for (const u of unlisten) {
+        try {
+          u();
+        } catch (_) {}
+      }
     };
   });
 
@@ -251,10 +359,10 @@
 </script>
 
 {#snippet dockButtons()}
-  <button class="icon" aria-label="Settings" onclick={() => api.openWindow("settings")}>
+  <button class="icon" aria-label={t("w.settings")} onclick={() => api.openWindow("settings").catch(() => {})}>
     <Icon name="gear-six" size={15} />
   </button>
-  <button class="icon" aria-label="History" onclick={() => api.openWindow("history")}>
+  <button class="icon" aria-label={t("w.history")} onclick={() => api.openWindow("history").catch(() => {})}>
     <Icon name="clock-counter-clockwise" size={15} />
   </button>
 {/snippet}
@@ -280,10 +388,10 @@
       data-state={status.status}
       onclick={handleSeal}
       aria-label={status.status === "recording"
-        ? "Stop recording"
+        ? t("w.stop")
         : status.status === "processing"
-          ? "Cancel transcription"
-          : "Start recording"}
+          ? t("w.cancelTx")
+          : t("w.start")}
     >
       <span class="core"></span>
       <span class="halo"></span>
@@ -291,7 +399,7 @@
 
     <div class="center" data-tauri-drag-region>
       {#if status.status === "recording"}
-        <div class="wave" aria-label="Microphone level">
+        <div class="wave" aria-label={t("w.level")}>
           {#each levels as value}
             <span class="bar" style={`height:${(2 + value * 13).toFixed(1)}px`}></span>
           {/each}
@@ -301,12 +409,17 @@
       {:else if status.status === "processing"}
         <div class="proc-row">
           <span class="brand shimmer proc-text" class:slow={elapsed >= 20}>{procLabel}</span>
-          <button class="proc-cancel" onclick={cancelProcessing} aria-label="Cancel transcription" title="Cancel transcription">
+          <button class="proc-cancel" onclick={cancelProcessing} aria-label={t("w.cancelTx")} title={t("w.cancelTx")}>
             <Icon name="x" size={11} />
           </button>
         </div>
+      {:else if idle.section}
+        {@const target = idle.section}
+        <button class="brand dim link" onclick={() => openSection(target)}>
+          {idleText}
+        </button>
       {:else}
-        <span class="brand" class:dim={!status.engine_ready || !status.audio_available}>
+        <span class="brand" class:dim={idle.dim}>
           {idleText}
         </span>
       {/if}
@@ -531,6 +644,29 @@
   .brand.dim {
     color: var(--ink-faint);
     font-weight: 500;
+  }
+
+  .brand.link {
+    min-width: 0;
+    padding: 0;
+    text-align: left;
+    pointer-events: auto;
+    cursor: pointer;
+    text-decoration: underline;
+    text-decoration-color: transparent;
+    text-underline-offset: 3px;
+    transition: color 0.16s ease, text-decoration-color 0.16s ease;
+  }
+
+  .brand.link:hover {
+    color: var(--terra-text);
+    text-decoration-color: currentColor;
+  }
+
+  .brand.link:focus-visible {
+    outline: none;
+    color: var(--terra-text);
+    text-decoration-color: currentColor;
   }
 
   .brand.shimmer {

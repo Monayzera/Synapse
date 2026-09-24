@@ -462,8 +462,7 @@ fn set_executable(path: &Path) {
 }
 
 fn configure_settings(state: &SharedState, gpu: bool, model_filename: &str) -> AppResult<()> {
-    {
-        let mut settings = state.settings.write();
+    state.mutate_settings(|settings| {
         settings.llm_enabled = true;
         settings.llm_backend = LlmBackend::Local;
         settings.llm_local_model = model_filename.to_string();
@@ -472,6 +471,8 @@ fn configure_settings(state: &SharedState, gpu: bool, model_filename: &str) -> A
         settings.llm_temperature = 0.1;
         settings.llm_gpu_layers = if gpu { 99 } else { 0 };
         settings.llm_timeout_ms = if gpu { 4000 } else { 8000 };
-    }
-    state.persist_settings()
+        Ok(())
+    })?;
+    state.emit_settings_changed();
+    Ok(())
 }

@@ -1,9 +1,33 @@
+use crate::autostart::{self, AutostartStatus};
 use crate::config::Settings;
+use crate::error::AppError;
 use crate::history::{HistoryEntry, Stats};
 use crate::models::ModelStatus;
-use crate::state::{SharedState, StatusPayload};
-use crate::{audio, history, hotkey, inject, models, pipeline, services};
+use crate::state::{SharedState, StatusPayload, SETTINGS_UNREADABLE};
+use crate::{audio, history, inject, models, pipeline, services};
 use tauri::{AppHandle, Emitter, Manager, State};
+
+const SETTINGS_SECTIONS: [&str; 5] = ["general", "voice", "ai", "dictionary", "advanced"];
+
+fn settings_error(err: AppError) -> String {
+    match err {
+        AppError::Config(message) if message == SETTINGS_UNREADABLE => SETTINGS_UNREADABLE.to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn refuse_unreadable(shared: &SharedState) -> Result<(), String> {
+    if shared.settings_unreadable() {
+        pipeline::emit_error(
+            &shared.app,
+            "settings",
+            SETTINGS_UNREADABLE,
+            "The settings file is locked; changes cannot be saved yet.",
+        );
+        return Err(SETTINGS_UNREADABLE.to_string());
+    }
+    Ok(())
+}
 
 #[tauri::command]
 pub fn get_status(state: State<'_, SharedState>) -> StatusPayload {
@@ -16,76 +40,39 @@ pub fn get_settings(state: State<'_, SharedState>) -> Settings {
 }
 
 #[tauri::command]
-pub async fn save_settings(
+pub async fn update_settings(
     app: AppHandle,
     state: State<'_, SharedState>,
-    settings: Settings,
-) -> Result<(), String> {
+    patch: serde_json::Value,
+) -> Result<Settings, String> {
     let shared = state.inner().clone();
-    let old = shared.settings_snapshot();
-    *shared.settings.write() = settings.clone();
-    shared.persist_settings().map_err(|e| e.to_string())?;
+    refuse_unreadable(&shared)?;
+    let patch = match patch {
+        serde_json::Value::Object(map) => map,
+        _ => return Err("invalid settings patch: expected an object".to_string()),
+    };
+    let worker = shared.clone();
+    let (old, new) = tokio::task::spawn_blocking(move || {
+        worker.mutate_settings(|settings| {
+            *settings = settings.merged_with(&patch)?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|e| format!("settings update task failed: {e}"))?
+    .map_err(settings_error)?;
 
-    if old.audio_device != settings.audio_device {
-        shared.audio.set_device(settings.audio_device.clone());
-    }
-
-    if old.hotkey_ptt != settings.hotkey_ptt
-        || old.hotkey_toggle != settings.hotkey_toggle
-        || old.record_mode != settings.record_mode
-    {
-        if let Err(err) = hotkey::apply(&app, &shared) {
-            let _ = app.emit("pipeline-error", err.to_string());
+    services::apply_settings_change(&app, &shared, &old, &new);
+    if old.autostart != new.autostart {
+        let desired = shared.settings.read().autostart;
+        if let Err(err) = autostart::apply(&app, desired) {
+            tracing::warn!("autostart change not applied: {err}");
         }
     }
 
-    if old.vad_enabled != settings.vad_enabled {
-        shared.reload_vad();
-    }
-
-    let switched_to_local = old.transcription_backend != settings.transcription_backend
-        && settings.transcription_backend == crate::config::TranscriptionBackend::Local;
-    if old.whisper_model != settings.whisper_model
-        || old.prefer_gpu != settings.prefer_gpu
-        || switched_to_local
-    {
-        let engine_state = shared.clone();
-        let prefer = settings.prefer_gpu;
-        let outcome = tokio::task::spawn_blocking(move || engine_state.load_engine(prefer)).await;
-        let failure = match outcome {
-            Ok(Ok(())) => None,
-            Ok(Err(err)) => Some(err.to_string()),
-            Err(err) => Some(err.to_string()),
-        };
-        if let Some(message) = failure {
-            let _ = app.emit(
-                "pipeline-error",
-                serde_json::json!({ "stage": "engine", "message": message }),
-            );
-        }
-    }
-
-    if llm_changed(&old, &settings) {
-        let sidecar_state = shared.clone();
-        tauri::async_runtime::spawn(async move {
-            services::restart_sidecar(&sidecar_state).await;
-        });
-    }
-
-    if old.autostart != settings.autostart {
-        let _ = services::set_autostart(&app, settings.autostart);
-    }
-
+    shared.emit_settings_changed();
     shared.emit_status();
-    Ok(())
-}
-
-fn llm_changed(old: &Settings, new: &Settings) -> bool {
-    old.llm_enabled != new.llm_enabled
-        || old.translation_enabled != new.translation_enabled
-        || old.llm_backend != new.llm_backend
-        || old.llm_local_model != new.llm_local_model
-        || old.llm_endpoint != new.llm_endpoint
+    Ok(new)
 }
 
 #[tauri::command]
@@ -109,8 +96,9 @@ pub fn get_history(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<HistoryEntry>, String> {
-    let conn = state.db.lock();
-    history::list(&conn, limit.clamp(1, 500), offset.max(0)).map_err(|e| e.to_string())
+    state
+        .with_db(|conn| history::list(conn, limit.clamp(1, 500), offset.max(0)))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -119,34 +107,37 @@ pub fn search_history(
     query: String,
     limit: i64,
 ) -> Result<Vec<HistoryEntry>, String> {
-    let conn = state.db.lock();
-    history::search(&conn, &query, limit.clamp(1, 500)).map_err(|e| e.to_string())
+    state
+        .with_db(|conn| history::search(conn, &query, limit.clamp(1, 500)))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn delete_history(state: State<'_, SharedState>, id: i64) -> Result<(), String> {
-    let conn = state.db.lock();
-    history::delete(&conn, id).map_err(|e| e.to_string())
+    state
+        .with_db(|conn| history::delete(conn, id))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn clear_history(state: State<'_, SharedState>) -> Result<(), String> {
-    let conn = state.db.lock();
-    history::clear(&conn).map_err(|e| e.to_string())
+    state
+        .with_db(|conn| history::clear(conn))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn get_stats(state: State<'_, SharedState>) -> Result<Stats, String> {
-    let conn = state.db.lock();
-    history::stats(&conn).map_err(|e| e.to_string())
+    state
+        .with_db(|conn| history::stats(conn))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn recopy(state: State<'_, SharedState>, id: i64) -> Result<(), String> {
-    let entry = {
-        let conn = state.db.lock();
-        history::get(&conn, id).map_err(|e| e.to_string())?
-    };
+    let entry = state
+        .with_db(|conn| history::get(conn, id))
+        .map_err(|e| e.to_string())?;
     let entry = entry.ok_or_else(|| "entry not found".to_string())?;
     inject::copy_to_clipboard(&entry.final_text).map_err(|e| e.to_string())
 }
@@ -160,11 +151,16 @@ pub fn add_to_dictionary(
     if phrase.trim().is_empty() {
         return Err("phrase cannot be empty".to_string());
     }
-    {
-        let mut settings = state.settings.write();
-        settings.dictionary.insert(phrase, replacement);
-    }
-    state.persist_settings().map_err(|e| e.to_string())
+    let shared = state.inner().clone();
+    refuse_unreadable(&shared)?;
+    shared
+        .mutate_settings(|settings| {
+            settings.dictionary.insert(phrase, replacement);
+            Ok(())
+        })
+        .map_err(settings_error)?;
+    shared.emit_settings_changed();
+    Ok(())
 }
 
 #[tauri::command]
@@ -191,6 +187,7 @@ fn spawn_download(
     app: AppHandle,
     shared: SharedState,
     info: models::ModelInfo,
+    activate: bool,
 ) -> Result<(), String> {
     {
         let mut active = shared.downloading.lock();
@@ -207,18 +204,29 @@ fn spawn_download(
     };
     tauri::async_runtime::spawn(async move {
         let _guard = guard;
-        if let Err(err) = models::download(&app_handle, &models_dir, &info).await {
-            let _ = app_handle.emit(
-                "model-download-progress",
-                serde_json::json!({
-                    "id": info.id,
-                    "downloaded": 0,
-                    "total": info.size_bytes,
-                    "pct": 0.0,
-                    "done": false,
-                    "error": err.to_string(),
-                }),
-            );
+        match models::download(&app_handle, &models_dir, &info).await {
+            Ok(()) => {
+                tracing::info!("model {} downloaded", info.id);
+                if activate {
+                    if let Err(err) = services::activate_model(&shared, &info) {
+                        tracing::warn!("downloaded model {} not activated: {err}", info.id);
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!("model {} download failed: {err}", info.id);
+                let _ = app_handle.emit(
+                    "model-download-progress",
+                    serde_json::json!({
+                        "id": info.id,
+                        "downloaded": 0,
+                        "total": info.size_bytes,
+                        "pct": 0.0,
+                        "done": false,
+                        "error": err.to_string(),
+                    }),
+                );
+            }
         }
     });
     Ok(())
@@ -229,11 +237,25 @@ pub fn download_model(
     app: AppHandle,
     state: State<'_, SharedState>,
     id: String,
+    activate: bool,
 ) -> Result<(), String> {
     let info = state
         .resolve_model(&id)
         .ok_or_else(|| format!("unknown model: {id}"))?;
-    spawn_download(app, state.inner().clone(), info)
+    spawn_download(app, state.inner().clone(), info, activate)
+}
+
+#[tauri::command]
+pub async fn activate_model(
+    state: State<'_, SharedState>,
+    id: String,
+) -> Result<Settings, String> {
+    let shared = state.inner().clone();
+    refuse_unreadable(&shared)?;
+    let info = shared
+        .resolve_model(&id)
+        .ok_or_else(|| format!("unknown model: {id}"))?;
+    services::activate_model(&shared, &info).map_err(settings_error)
 }
 
 #[tauri::command]
@@ -281,7 +303,9 @@ pub fn add_custom_model(
     let info = crate::custom_models::to_info(&model);
     let _ = app.emit("models-changed", ());
     if download_now {
-        let _ = spawn_download(app, state.inner().clone(), info.clone());
+        if let Err(err) = spawn_download(app, state.inner().clone(), info.clone(), false) {
+            tracing::warn!("custom model download not started: {err}");
+        }
     }
     Ok(info)
 }
@@ -316,36 +340,37 @@ pub async fn delete_model(
         .filter(|m| m.id != id && models::is_present(&shared.models_dir, m))
         .collect();
 
-    let mut reload_whisper = false;
-    let mut restart_llm = false;
-    {
-        let mut settings = shared.settings.write();
-        if info.kind == models::ModelKind::Whisper && settings.whisper_model == id {
-            settings.whisper_model = present
-                .iter()
-                .find(|m| m.kind == models::ModelKind::Whisper && m.id == "large-v3-turbo")
-                .or_else(|| present.iter().find(|m| m.kind == models::ModelKind::Whisper))
-                .map(|m| m.id.clone())
-                .unwrap_or_else(|| "large-v3-turbo".to_string());
-            reload_whisper = true;
-        }
-        if info.kind == models::ModelKind::Llm && settings.llm_local_model == info.filename {
-            settings.llm_local_model = present
-                .iter()
-                .find(|m| m.kind == models::ModelKind::Llm && m.filename == "google_gemma-3-4b-it-Q4_K_M.gguf")
-                .or_else(|| present.iter().find(|m| m.kind == models::ModelKind::Llm))
-                .map(|m| m.filename.clone())
-                .unwrap_or_else(|| "google_gemma-3-4b-it-Q4_K_M.gguf".to_string());
-            restart_llm = true;
-        }
-    }
+    let current = shared.settings_snapshot();
+    let reload_whisper =
+        info.kind == models::ModelKind::Whisper && current.whisper_model == id;
+    let restart_llm =
+        info.kind == models::ModelKind::Llm && current.llm_local_model == info.filename;
     if reload_whisper || restart_llm {
-        shared.persist_settings().map_err(|e| e.to_string())?;
+        shared
+            .mutate_settings(|settings| {
+                if reload_whisper {
+                    settings.whisper_model = present
+                        .iter()
+                        .find(|m| m.kind == models::ModelKind::Whisper && m.id == "large-v3-turbo")
+                        .or_else(|| present.iter().find(|m| m.kind == models::ModelKind::Whisper))
+                        .map(|m| m.id.clone())
+                        .unwrap_or_else(|| "large-v3-turbo".to_string());
+                }
+                if restart_llm {
+                    settings.llm_local_model = present
+                        .iter()
+                        .find(|m| m.kind == models::ModelKind::Llm && m.filename == "google_gemma-3-4b-it-Q4_K_M.gguf")
+                        .or_else(|| present.iter().find(|m| m.kind == models::ModelKind::Llm))
+                        .map(|m| m.filename.clone())
+                        .unwrap_or_else(|| "google_gemma-3-4b-it-Q4_K_M.gguf".to_string());
+                }
+                Ok(())
+            })
+            .map_err(settings_error)?;
+        shared.emit_settings_changed();
     }
     if reload_whisper {
-        let engine_state = shared.clone();
-        let prefer = engine_state.settings_snapshot().prefer_gpu;
-        let _ = tokio::task::spawn_blocking(move || engine_state.load_engine(prefer)).await;
+        services::load_engine_supervised(&shared);
     }
     if restart_llm {
         services::restart_sidecar(&shared).await;
@@ -416,8 +441,56 @@ pub async fn test_llm(state: State<'_, SharedState>) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
-    services::set_autostart(&app, enabled)
+pub fn autostart_status(app: AppHandle) -> AutostartStatus {
+    autostart::status(&app)
+}
+
+#[tauri::command]
+pub async fn set_autostart(
+    app: AppHandle,
+    state: State<'_, SharedState>,
+    enabled: bool,
+) -> Result<AutostartStatus, String> {
+    let shared = state.inner().clone();
+    refuse_unreadable(&shared)?;
+    shared
+        .mutate_settings(|settings| {
+            settings.autostart = enabled;
+            Ok(())
+        })
+        .map_err(settings_error)?;
+    let desired = shared.settings.read().autostart;
+    let applied = autostart::apply(&app, desired);
+    shared.emit_settings_changed();
+    let mut status = autostart::status(&app);
+    if let Err(err) = applied {
+        status.error = Some(err);
+    }
+    Ok(status)
+}
+
+#[tauri::command]
+pub fn open_settings(app: AppHandle, section: Option<String>) -> Result<(), String> {
+    let window = app
+        .get_webview_window("settings")
+        .ok_or_else(|| "settings window unavailable".to_string())?;
+    if let Err(err) = window.show() {
+        tracing::warn!("settings window show failed: {err}");
+    }
+    if let Err(err) = window.unminimize() {
+        tracing::debug!("settings window unminimize failed: {err}");
+    }
+    if let Err(err) = window.set_focus() {
+        tracing::debug!("settings window focus failed: {err}");
+    }
+    if let Some(section) = section {
+        if !SETTINGS_SECTIONS.contains(&section.as_str()) {
+            tracing::warn!("unknown settings section requested: {section}");
+        }
+        app.emit_to("settings", "settings-navigate", section)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]

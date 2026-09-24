@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::OnceLock;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
 type CFMachPortRef = *mut c_void;
 type CFRunLoopSourceRef = *mut c_void;
@@ -85,25 +85,18 @@ struct TapPort(CFMachPortRef);
 unsafe impl Send for TapPort {}
 unsafe impl Sync for TapPort {}
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum BindKind {
-    Ptt,
-    Toggle,
-}
-
 struct Binding {
     ctrl: bool,
     shift: bool,
     alt: bool,
     meta: bool,
     keycode: u16,
-    kind: BindKind,
     active: AtomicBool,
 }
 
 enum HotEvent {
-    Press(BindKind),
-    Release(BindKind),
+    Press,
+    Release,
 }
 
 static BINDINGS: OnceLock<RwLock<Vec<Binding>>> = OnceLock::new();
@@ -114,15 +107,14 @@ fn bindings() -> &'static RwLock<Vec<Binding>> {
     BINDINGS.get_or_init(|| RwLock::new(Vec::new()))
 }
 
-pub fn set_bindings(settings: &Settings) {
+pub fn set_bindings(settings: &Settings) -> bool {
     let mut list = Vec::new();
-    if let Some(binding) = parse_binding(&settings.hotkey_ptt, BindKind::Ptt) {
+    if let Some(binding) = parse_binding(&settings.hotkey_ptt) {
         list.push(binding);
     }
-    if let Some(binding) = parse_binding(&settings.hotkey_toggle, BindKind::Toggle) {
-        list.push(binding);
-    }
+    let parsed = !list.is_empty();
     *bindings().write() = list;
+    parsed
 }
 
 pub fn start(app: AppHandle) {
@@ -132,26 +124,37 @@ pub fn start(app: AppHandle) {
     }
 
     let dispatch_app = app.clone();
-    std::thread::Builder::new()
+    let dispatch_spawn = std::thread::Builder::new()
         .name("synapse-hotkey-dispatch".to_string())
-        .spawn(move || {
-            while let Ok(event) = rx.recv() {
-                dispatch(&dispatch_app, event);
+        .spawn(move || loop {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                while let Ok(event) = rx.recv() {
+                    dispatch(&dispatch_app, event);
+                }
+            }));
+            match outcome {
+                Ok(()) => return,
+                Err(_) => tracing::error!("hotkey dispatcher panicked; restarting it"),
             }
-        })
-        .ok();
+        });
+    if let Err(err) = dispatch_spawn {
+        tracing::error!("could not start thread synapse-hotkey-dispatch: {err}");
+    }
 
-    std::thread::Builder::new()
+    let grab_app = app.clone();
+    let grab_spawn = std::thread::Builder::new()
         .name("synapse-hotkey-grab".to_string())
         .spawn(move || {
+            let app = grab_app;
             let trusted = prompt_accessibility();
             let mut warned = false;
             let mut attempts: u32 = 0;
             loop {
-                if run_event_tap() {
+                if run_event_tap(&app) {
                     break;
                 }
                 attempts += 1;
+                crate::hotkey::set_hook_ready(&app, false);
                 if !warned {
                     warned = true;
                     let message = if trusted || unsafe { AXIsProcessTrusted() } {
@@ -162,21 +165,18 @@ pub fn start(app: AppHandle) {
                         open_accessibility_settings();
                         "Allow Synapse in System Settings > Privacy & Security > Accessibility. The global shortcut starts working as soon as you enable it."
                     };
-                    let _ = app.emit(
-                        "pipeline-error",
-                        serde_json::json!({
-                            "stage": "hotkey",
-                            "message": message
-                        }),
-                    );
+                    crate::hotkey::report_failure(&app, message);
                 } else {
                     tracing::debug!("hotkey tap retry {attempts} failed");
                 }
                 let backoff = if attempts < 10 { 3 } else { 30 };
                 std::thread::sleep(Duration::from_secs(backoff));
             }
-        })
-        .ok();
+        });
+    if let Err(err) = grab_spawn {
+        tracing::error!("could not start thread synapse-hotkey-grab: {err}");
+        crate::hotkey::set_hook_ready(&app, false);
+    }
 }
 
 fn prompt_accessibility() -> bool {
@@ -199,7 +199,7 @@ fn prompt_accessibility() -> bool {
     }
 }
 
-fn run_event_tap() -> bool {
+fn run_event_tap(app: &AppHandle) -> bool {
     unsafe {
         let mask: u64 = (1u64 << KEY_DOWN) | (1u64 << KEY_UP);
         let port = CGEventTapCreate(0, 0, 0, mask, tap_callback, ptr::null_mut());
@@ -214,6 +214,8 @@ fn run_event_tap() -> bool {
         CFRunLoopAddSource(runloop, source, kCFRunLoopCommonModes);
         let _ = TAP_PORT.set(TapPort(port));
         CGEventTapEnable(port, true);
+        tracing::info!("global shortcut event tap installed");
+        crate::hotkey::set_hook_ready(app, true);
         CFRunLoopRun();
         true
     }
@@ -259,19 +261,17 @@ fn dispatch(app: &AppHandle, event: HotEvent) {
         Some(state) => state.inner().clone(),
         None => return,
     };
-    let mode = state.settings_snapshot().record_mode;
+    let mode = state.settings.read().record_mode;
     match event {
-        HotEvent::Press(BindKind::Ptt) => match mode {
+        HotEvent::Press => match mode {
             RecordMode::PushToTalk => pipeline::begin_recording(&state),
-            RecordMode::Toggle => pipeline::toggle_recording(app.clone(), state.clone()),
+            RecordMode::Toggle => pipeline::hotkey_toggle(app.clone(), state.clone()),
         },
-        HotEvent::Release(BindKind::Ptt) => {
+        HotEvent::Release => {
             if mode == RecordMode::PushToTalk {
                 pipeline::finish_recording(app.clone(), state.clone());
             }
         }
-        HotEvent::Press(BindKind::Toggle) => pipeline::toggle_recording(app.clone(), state.clone()),
-        HotEvent::Release(BindKind::Toggle) => {}
     }
 }
 
@@ -307,13 +307,13 @@ fn handle(keycode: u16, is_down: bool, flags: u64) -> bool {
                 }
             } else if modifiers_match(binding, flags) {
                 binding.active.store(true, Ordering::Relaxed);
-                send(HotEvent::Press(binding.kind));
+                send(HotEvent::Press);
                 if should_swallow(binding) {
                     swallow = true;
                 }
             }
         } else if binding.active.swap(false, Ordering::Relaxed) {
-            send(HotEvent::Release(binding.kind));
+            send(HotEvent::Release);
             if should_swallow(binding) {
                 swallow = true;
             }
@@ -322,7 +322,7 @@ fn handle(keycode: u16, is_down: bool, flags: u64) -> bool {
     swallow
 }
 
-fn parse_binding(accelerator: &str, kind: BindKind) -> Option<Binding> {
+fn parse_binding(accelerator: &str) -> Option<Binding> {
     let trimmed = accelerator.trim();
     if trimmed.is_empty() {
         return None;
@@ -348,7 +348,6 @@ fn parse_binding(accelerator: &str, kind: BindKind) -> Option<Binding> {
         alt,
         meta,
         keycode: keycode?,
-        kind,
         active: AtomicBool::new(false),
     })
 }

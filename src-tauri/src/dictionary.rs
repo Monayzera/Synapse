@@ -36,30 +36,30 @@ fn bounded_pattern(phrase: &str) -> String {
     )
 }
 
-const SAFE_FILLERS: &[&str] = &[
-    "aham", "ahn", "ahm", "ééé", "é é", "éé", "eh", "ehh", "er", "err", "hm", "hmm", "hmmm",
-    "hum", "humm", "uh", "uhh", "uhm", "mmm", "ã", "ãã", "ãhã",
-];
-
-fn is_safe_filler(word: &str) -> bool {
-    let lowered = word.trim().to_lowercase();
-    SAFE_FILLERS.iter().any(|safe| *safe == lowered)
-}
-
 fn strip_fillers(text: &str, fillers: &[String]) -> String {
-    let parts: Vec<String> = fillers
+    let mut words: Vec<&str> = fillers
         .iter()
         .map(|f| f.trim())
-        .filter(|f| !f.is_empty() && is_safe_filler(f))
-        .map(bounded_pattern)
+        .filter(|f| !f.is_empty())
         .collect();
+    words.sort_by(|a, b| {
+        b.chars()
+            .count()
+            .cmp(&a.chars().count())
+            .then_with(|| a.cmp(b))
+    });
+    words.dedup();
+    let parts: Vec<String> = words.into_iter().map(bounded_pattern).collect();
     if parts.is_empty() {
         return text.to_string();
     }
     let pattern = format!("(?i)(?:{})", parts.join("|"));
     match Regex::new(&pattern) {
         Ok(re) => re.replace_all(text, " ").to_string(),
-        Err(_) => text.to_string(),
+        Err(err) => {
+            tracing::warn!("filler pattern rejected ({err}); fillers kept");
+            text.to_string()
+        }
     }
 }
 
@@ -117,4 +117,52 @@ fn normalize(text: &str) -> String {
 
 pub fn word_count(text: &str) -> i64 {
     text.split_whitespace().filter(|w| !w.is_empty()).count() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn words(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn removes_user_words_case_insensitively() {
+        let out = process(
+            "Eh eu acho ÉÉÉ que sim",
+            true,
+            &words(&["eh", "ééé"]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(out, "eu acho que sim");
+    }
+
+    #[test]
+    fn removes_any_user_word_not_only_builtin() {
+        let out = process(
+            "então tipo assim vamos",
+            true,
+            &words(&["tipo assim", "tipo"]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(out, "então vamos");
+    }
+
+    #[test]
+    fn keeps_partial_word_matches() {
+        let out = process(
+            "ehh herói umbigo",
+            true,
+            &words(&["eh", "um"]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(out, "ehh herói umbigo");
+    }
+
+    #[test]
+    fn disabled_removal_keeps_text() {
+        let out = process("uh ok", false, &words(&["uh"]), &BTreeMap::new());
+        assert_eq!(out, "uh ok");
+    }
 }

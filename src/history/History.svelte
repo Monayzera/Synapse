@@ -3,8 +3,9 @@
   import { fly } from "svelte/transition";
   import { cubicOut } from "svelte/easing";
   import { api, on, getCurrentWindow, type UnlistenFn } from "../lib/ipc";
-  import type { HistoryEntry, Stats } from "../lib/types";
+  import type { HistoryEntry, Settings, Stats } from "../lib/types";
   import Icon from "../lib/Icon.svelte";
+  import { t, locale, setLanguage } from "../lib/i18n.svelte";
 
   let entries = $state<HistoryEntry[]>([]);
   let stats = $state<Stats>({ total_entries: 0, total_words: 0, total_speaking_ms: 0, avg_wpm: 0 });
@@ -17,17 +18,51 @@
   const reduce =
     typeof matchMedia !== "undefined" && matchMedia("(prefers-reduced-motion: reduce)").matches;
 
+  $effect(() => {
+    const title = t("title.history");
+    try {
+      document.title = title;
+    } catch (_) {
+      return;
+    }
+    getCurrentWindow()
+      .setTitle(title)
+      .catch(() => {});
+  });
+
   onMount(() => {
     let unlisten: UnlistenFn[] = [];
+    let disposed = false;
     refresh();
     (async () => {
       try {
         unlisten.push(await on("transcription-complete", () => refresh()));
       } catch (_) {}
+      try {
+        unlisten.push(
+          await on<Settings>("settings-changed", (e) => {
+            if (e.payload && typeof e.payload === "object") setLanguage(e.payload.ui_language);
+          }),
+        );
+      } catch (_) {}
+      for (let attempt = 0; attempt < 20 && !disposed; attempt++) {
+        try {
+          const loaded = await api.getSettings();
+          if (!disposed && loaded && typeof loaded === "object") setLanguage(loaded.ui_language);
+          break;
+        } catch (_) {
+          await new Promise((r) => setTimeout(r, Math.min(2000, 300 + attempt * 200)));
+        }
+      }
     })();
     return () => {
+      disposed = true;
       clearTimeout(searchTimer);
-      unlisten.forEach((u) => u());
+      unlisten.forEach((u) => {
+        try {
+          u();
+        } catch (_) {}
+      });
     };
   });
 
@@ -74,15 +109,15 @@
   }
 
   async function toDict(entry: HistoryEntry) {
-    const phrase = prompt("Spoken phrase (as Whisper heard it):", entry.raw_text);
+    const phrase = prompt(t("h.promptPhrase"), entry.raw_text);
     if (phrase === null) return;
-    const replacement = prompt("Exact replacement:", entry.final_text);
+    const replacement = prompt(t("h.promptReplacement"), entry.final_text);
     if (replacement === null) return;
     await api.addToDictionary(phrase, replacement).catch(() => {});
   }
 
   function fmtTime(ms: number): string {
-    return new Date(ms).toLocaleString("en-US", {
+    return new Date(ms).toLocaleString(locale(), {
       day: "2-digit",
       month: "2-digit",
       hour: "2-digit",
@@ -90,15 +125,22 @@
     });
   }
 
+  function fmtNum(v: number, digits: number): string {
+    return v.toLocaleString(locale(), {
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+    });
+  }
+
   function fmtDuration(ms: number): string {
-    return (ms / 1000).toFixed(1) + " s";
+    return fmtNum(ms / 1000, 1) + " " + t("h.sec");
   }
 
   function fmtSpeaking(ms: number): string {
     const min = Math.floor(ms / 60000);
-    if (min >= 60) return (min / 60).toFixed(1) + " h";
-    if (min >= 1) return min + " min";
-    return Math.round(ms / 1000) + " s";
+    if (min >= 60) return fmtNum(min / 60, 1) + " " + t("h.hour");
+    if (min >= 1) return min + " " + t("h.min");
+    return Math.round(ms / 1000) + " " + t("h.sec");
   }
 
   function wpm(entry: HistoryEntry): number {
@@ -115,23 +157,23 @@
   <header class="titlebar" data-tauri-drag-region>
     <div class="brand">
       <span class="logo"></span>
-      <h1>Synapse <span>· History</span></h1>
+      <h1>Synapse <span>· {t("app.history")}</span></h1>
     </div>
     <div class="head-actions">
       {#if confirmClear}
-        <span class="confirm-q">Clear all history?</span>
-        <button class="btn btn-confirm" onclick={doClear}>Confirm</button>
-        <button class="btn ghost" onclick={() => (confirmClear = false)}>Cancel</button>
+        <span class="confirm-q">{t("h.clearAsk")}</span>
+        <button class="btn btn-confirm" onclick={doClear}>{t("h.confirm")}</button>
+        <button class="btn ghost" onclick={() => (confirmClear = false)}>{t("common.cancel")}</button>
       {:else}
         <button class="btn danger" onclick={() => (confirmClear = true)}>
-          <Icon name="trash" size={15} /> Clear all
+          <Icon name="trash" size={15} /> {t("h.clearAll")}
         </button>
       {/if}
       <div class="winbtns">
-        <button class="winbtn" title="Minimize" aria-label="Minimize" onclick={minimize}>
+        <button class="winbtn" title={t("win.minimize")} aria-label={t("win.minimize")} onclick={minimize}>
           <Icon name="minus" size={15} />
         </button>
-        <button class="winbtn close" title="Close" aria-label="Close" onclick={() => api.hideWindow("history")}>
+        <button class="winbtn close" title={t("win.close")} aria-label={t("win.close")} onclick={() => api.hideWindow("history").catch(() => {})}>
           <Icon name="x" size={15} />
         </button>
       </div>
@@ -141,29 +183,29 @@
   <div class="body">
     <div class="stats card">
       <div class="stat">
-        <span class="num tnum">{stats.total_words.toLocaleString("en-US")}</span>
-        <span class="lbl">Words</span>
+        <span class="num tnum">{stats.total_words.toLocaleString(locale())}</span>
+        <span class="lbl">{t("h.words")}</span>
       </div>
       <div class="stat">
         <span class="num tnum">{fmtSpeaking(stats.total_speaking_ms)}</span>
-        <span class="lbl">Speaking time</span>
+        <span class="lbl">{t("h.speaking")}</span>
       </div>
       <div class="stat">
         <span class="num tnum">{stats.avg_wpm.toFixed(0)}</span>
-        <span class="lbl" title="Words per minute">Avg WPM</span>
+        <span class="lbl" title={t("h.wpmTitle")}>{t("h.avgWpm")}</span>
       </div>
       <div class="stat">
-        <span class="num tnum">{stats.total_entries.toLocaleString("en-US")}</span>
-        <span class="lbl">Entries</span>
+        <span class="num tnum">{stats.total_entries.toLocaleString(locale())}</span>
+        <span class="lbl">{t("h.entries")}</span>
       </div>
     </div>
 
     <div class="toolbar">
       <div class="search">
         <Icon name="magnifying-glass" size={17} />
-        <input placeholder="Search history…" bind:value={query} oninput={onSearch} />
+        <input placeholder={t("h.search")} bind:value={query} oninput={onSearch} />
       </div>
-      <span class="count tnum">{entries.length} {entries.length === 1 ? "entry" : "entries"}</span>
+      <span class="count tnum">{entries.length} {entries.length === 1 ? t("h.entryOne") : t("h.entryMany")}</span>
     </div>
 
     <div class="list">
@@ -180,34 +222,34 @@
           >
             <div class="final">{e.final_text}</div>
             {#if expanded.has(e.id) && e.raw_text !== e.final_text}
-              <div class="raw"><span class="raw-mark">raw</span>{e.raw_text}</div>
+              <div class="raw"><span class="raw-mark">{t("h.raw")}</span>{e.raw_text}</div>
             {/if}
             <div class="meta tnum">
               <span>{fmtTime(e.created_at)}</span>
               <span class="dot">·</span>
               <span>{fmtDuration(e.duration_ms)}</span>
               <span class="dot">·</span>
-              <span title="Words per minute">{wpm(e)} WPM</span>
+              <span title={t("h.wpmTitle")}>{wpm(e)} {t("h.wpm")}</span>
               {#if e.cloud}
-                <span class="tag cloud">Cloud</span>
+                <span class="tag cloud">{t("h.cloud")}</span>
               {:else if e.on_gpu}
-                <span class="tag gpu">GPU</span>
+                <span class="tag gpu">{t("h.gpu")}</span>
               {:else}
-                <span class="tag cpu">CPU</span>
+                <span class="tag cpu">{t("h.cpu")}</span>
               {/if}
-              {#if e.llm_used}<span class="tag llm">AI</span>{/if}
+              {#if e.llm_used}<span class="tag llm">{t("h.ai")}</span>{/if}
             </div>
           </div>
           <div class="entry-actions">
             <button class="btn ghost" onclick={() => copy(e.id)}>
               <Icon name={copiedId === e.id ? "check-circle" : "copy"} size={15} />
-              {copiedId === e.id ? "Copied" : "Copy"}
+              {copiedId === e.id ? t("h.copied") : t("h.copy")}
             </button>
             <button class="btn ghost" onclick={() => toDict(e)}>
-              <Icon name="book-bookmark" size={15} /> Dictionary
+              <Icon name="book-bookmark" size={15} /> {t("h.dictionary")}
             </button>
             <button class="btn ghost danger" onclick={() => remove(e.id)}>
-              <Icon name="trash" size={15} /> Delete
+              <Icon name="trash" size={15} /> {t("h.delete")}
             </button>
           </div>
         </div>
@@ -215,7 +257,7 @@
       {#if entries.length === 0}
         <div class="empty">
           <Icon name="bird" size={36} />
-          <p>No transcriptions yet. Hold the shortcut and speak.</p>
+          <p>{t("h.empty")}</p>
         </div>
       {/if}
     </div>
