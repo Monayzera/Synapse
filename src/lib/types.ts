@@ -96,6 +96,20 @@ export interface UpdateNotice {
   version: string | null;
 }
 
+export interface GroqModel {
+  id: string;
+  label: string;
+  reasoning: boolean;
+  context_window: number | null;
+  max_completion_tokens: number | null;
+  created: number;
+}
+
+export interface GroqModels {
+  models: GroqModel[];
+  error: string | null;
+}
+
 export interface StatusPayload {
   status: StatusKind;
   recording: boolean;
@@ -210,15 +224,6 @@ export interface DownloadProgress {
   pct: number;
   done: boolean;
   error?: string | null;
-}
-
-export interface CompletePayload {
-  raw_text: string;
-  final_text: string;
-  word_count: number;
-  duration_ms: number;
-  on_gpu: boolean;
-  llm_used: boolean;
 }
 
 export interface PipelineErrorPayload {

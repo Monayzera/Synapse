@@ -10,6 +10,7 @@ import type {
   AutostartStatus,
   SectionId,
   UpdateStatus,
+  GroqModels,
 } from "../lib/types";
 import { tOr, locale } from "../lib/i18n.svelte";
 
@@ -35,7 +36,7 @@ const DEFAULTS: Settings = {
   transcription_backend: "local",
   groq_api_key: "",
   groq_model: "whisper-large-v3-turbo",
-  groq_llm_model: "llama-3.1-8b-instant",
+  groq_llm_model: "qwen/qwen3.8-27b",
   groq_llm_api_key: "",
   audio_device: null,
   vad_enabled: true,
@@ -82,6 +83,7 @@ export const app = $state({
   llamaRunning: false,
   autostart: null as AutostartStatus | null,
   update: null as UpdateStatus | null,
+  groq: null as GroqModels | null,
   save: "idle" as SaveState,
   savePulse: 0,
   saveError: "",
@@ -291,6 +293,33 @@ export function refreshUpdate() {
     .catch(() => {});
 }
 
+let groqSeq = 0;
+
+function adoptGroq(g: unknown) {
+  if (!g || typeof g !== "object" || !Array.isArray((g as GroqModels).models)) return;
+  groqSeq++;
+  app.groq = g as GroqModels;
+}
+
+function loadCachedGroqModels() {
+  api
+    .groqModels(false)
+    .then((g) => {
+      if (!app.groq && g && typeof g === "object" && Array.isArray(g.models)) app.groq = g;
+    })
+    .catch(() => {});
+}
+
+export function refreshGroqModels() {
+  const seq = groqSeq;
+  api
+    .groqModels(true)
+    .then((g) => {
+      if (seq === groqSeq) adoptGroq(g);
+    })
+    .catch(() => {});
+}
+
 export async function checkUpdate(): Promise<void> {
   try {
     await api.checkUpdate();
@@ -444,6 +473,7 @@ export function start(): () => void {
         refreshLlama();
       }),
       on<UpdateStatus>("update-status", (e) => adoptUpdate(e.payload)),
+      on<GroqModels>("groq-models", (e) => adoptGroq(e.payload)),
     ]);
     for (const r of results) {
       if (r.status !== "fulfilled") continue;
@@ -466,6 +496,7 @@ export function start(): () => void {
     refreshAutostart();
     refreshStatus();
     refreshUpdate();
+    loadCachedGroqModels();
     api
       .hardwareInfo()
       .then((h) => {

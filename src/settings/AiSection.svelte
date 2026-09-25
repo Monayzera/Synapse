@@ -17,6 +17,7 @@
     testLlm,
     refreshModels,
     refreshLlama,
+    refreshGroqModels,
   } from "./store.svelte";
 
   let { s }: { s: Settings } = $props();
@@ -24,6 +25,7 @@
   onMount(() => {
     refreshModels();
     refreshLlama();
+    refreshGroqModels();
   });
 
   const TARGETS = [
@@ -37,16 +39,6 @@
     "Simplified Chinese",
     "Russian",
     "Korean",
-  ];
-
-  const GROQ_MODELS: { id: string; label: string }[] = [
-    { id: "llama-3.1-8b-instant", label: "Llama 3.1 8B" },
-    { id: "llama-3.3-70b-versatile", label: "Llama 3.3 70B" },
-    { id: "qwen/qwen3-32b", label: "Qwen 3 32B" },
-    { id: "openai/gpt-oss-120b", label: "GPT-OSS 120B" },
-    { id: "openai/gpt-oss-20b", label: "GPT-OSS 20B" },
-    { id: "meta-llama/llama-4-scout-17b-16e-instruct", label: "Llama 4 Scout" },
-    { id: "allam-2-7b", label: "Allam 2 7B" },
   ];
 
   const OTHER_TYPES: { id: LlmBackend; key: TKey }[] = [
@@ -64,6 +56,17 @@
   const llamaReady = $derived(!!app.llama && app.llama.binary && app.llama.model_present);
   const recommended = $derived(app.models.find((m) => m.info?.id === RECOMMENDED_LLM) ?? null);
   const progress = $derived(app.llamaProgress);
+  const groqModels = $derived(app.groq?.models ?? []);
+  const groqError = $derived.by(() => {
+    const code = app.groq?.error;
+    if (!code || code === "key_missing" || !s.groq_llm_api_key.trim()) return "";
+    return code === "invalid_key" ? t("ai.groqKeyInvalid") : t("ai.modelsFailed");
+  });
+
+  function shortId(id: string): string {
+    const tail = id.split("/").pop()?.trim();
+    return tail || id;
+  }
 
   function recommendedName(): string {
     const label = recommended?.info.label ?? "";
@@ -136,17 +139,24 @@
       link={{ label: t("voice.getKey"), onclick: openGroqKeys }}
     />
     <div class="item">
-      <label class="item-label" for="ai-groq-model">{t("ai.model")}</label>
+      {#if groqError}
+        <div class="item-text">
+          <label class="item-label" for="ai-groq-model">{t("ai.model")}</label>
+          <span class="item-sub err" title={groqError}>{groqError}</span>
+        </div>
+      {:else}
+        <label class="item-label" for="ai-groq-model">{t("ai.model")}</label>
+      {/if}
       <select
         id="ai-groq-model"
         value={s.groq_llm_model}
         onchange={(e) => void commit({ groq_llm_model: e.currentTarget.value })}
       >
-        {#each GROQ_MODELS as m}
+        {#each groqModels as m}
           <option value={m.id}>{m.label}</option>
         {/each}
-        {#if !GROQ_MODELS.some((m) => m.id === s.groq_llm_model)}
-          <option value={s.groq_llm_model}>{s.groq_llm_model}</option>
+        {#if !groqModels.some((m) => m.id === s.groq_llm_model)}
+          <option value={s.groq_llm_model}>{shortId(s.groq_llm_model)}</option>
         {/if}
       </select>
     </div>

@@ -5,7 +5,6 @@
   import { LogicalPosition, LogicalSize } from "@tauri-apps/api/dpi";
   import type {
     StatusPayload,
-    CompletePayload,
     PipelineErrorPayload,
     PrivacyKind,
     SectionId,
@@ -16,9 +15,11 @@
   import { t, tOr, setLanguage } from "../lib/i18n.svelte";
 
   const BAR_COUNT = 18;
-  const PILL_HALF = 75;
+  const PILL_EDGE = 85;
   const DOCK_NEED = 74;
-  const PILL_MIN = 150;
+  const PILL_MIN = 96;
+  const PILL_REC = 150;
+  const PILL_WIN = 190;
   const PILL_MAX = 440;
   const WINDOW_EXTRA = 170;
   const WINDOW_HEIGHT = 40;
@@ -197,16 +198,16 @@
     const seq = ++resizeSeq;
     clearTimeout(shrinkTimer);
     try {
-      const grow = targetPill > pillW;
+      const grow = Math.max(targetPill, PILL_WIN) > Math.max(pillW, PILL_WIN);
       if (grow) {
-        await resizeWindowTo(targetPill + WINDOW_EXTRA, dockSide === "right");
+        await resizeWindowTo(Math.max(targetPill, PILL_WIN) + WINDOW_EXTRA, dockSide === "right");
         if (seq === resizeSeq) pillW = targetPill;
       } else {
         pillW = targetPill;
         shrinkTimer = setTimeout(async () => {
           if (seq !== resizeSeq) return;
           try {
-            await resizeWindowTo(targetPill + WINDOW_EXTRA, dockSide === "right");
+            await resizeWindowTo(Math.max(targetPill, PILL_WIN) + WINDOW_EXTRA, dockSide === "right");
           } catch (_) {}
         }, 400);
       }
@@ -221,10 +222,10 @@
     void (async () => {
       await tick();
       if (mode === "recording") {
-        void applyWindowWidth(PILL_MIN);
+        void applyWindowWidth(PILL_REC);
         return;
       }
-      const textW = measureEl ? measureEl.scrollWidth : 0;
+      const textW = measureEl ? Math.ceil(measureEl.getBoundingClientRect().width) : 0;
       const extra = mode === "processing" ? 25 : 0;
       const target = Math.max(PILL_MIN, Math.min(PILL_MAX, 52 + textW + extra));
       void applyWindowWidth(target);
@@ -252,8 +253,7 @@
         currentMonitor(),
       ]);
       if (!mon) return;
-      const pillCenterX = pos.x + size.width / 2;
-      const pillRightX = pillCenterX + PILL_HALF * scale;
+      const pillRightX = pos.x + size.width - PILL_EDGE * scale;
       const monitorRight = mon.position.x + mon.size.width;
       const need = DOCK_NEED * scale;
       dockSide = monitorRight - pillRightX >= need ? "right" : "left";
@@ -333,9 +333,6 @@
         on<number>("audio-level", (e) => {
           if (typeof e.payload === "number") pushLevel(e.payload);
         }),
-        on<CompletePayload>("transcription-complete", (e) =>
-          showFlash(typeof e.payload?.final_text === "string" ? e.payload.final_text : "", "ok"),
-        ),
         on<PipelineErrorPayload | string>("pipeline-error", (e) =>
           showFlash(pipelineErrorText(e.payload), "err"),
         ),
@@ -510,9 +507,9 @@
     height: 40px;
     display: flex;
     align-items: center;
-    justify-content: center;
+    justify-content: flex-start;
     gap: 7px;
-    padding: 0 3px;
+    padding: 0 3px 0 18px;
   }
 
   .dock {

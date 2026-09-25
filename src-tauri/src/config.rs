@@ -98,7 +98,7 @@ impl Default for Settings {
             transcription_backend: TranscriptionBackend::Local,
             groq_api_key: String::new(),
             groq_model: "whisper-large-v3-turbo".to_string(),
-            groq_llm_model: "llama-3.1-8b-instant".to_string(),
+            groq_llm_model: crate::groq::DEFAULT_LLM_MODEL.to_string(),
             groq_llm_api_key: String::new(),
             audio_device: None,
             vad_enabled: true,

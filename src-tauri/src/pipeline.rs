@@ -371,19 +371,33 @@ async fn run_pipeline(
                 std::borrow::Cow::Borrowed(&settings)
             };
             let llm_start = std::time::Instant::now();
-            let cleanup = state.llm.cleanup(&eff, &processed);
-            tokio::pin!(cleanup);
-            let outcome = loop {
-                tokio::select! {
-                    out = &mut cleanup => break out,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(120)) => {
-                        if CANCEL.load(Ordering::Acquire) {
-                            let _ = app.emit("transcription-cancelled", ());
-                            return Ok(());
-                        }
-                    }
-                }
+            let Some(mut outcome) = cancellable(state.llm.cleanup(&eff, &processed)).await else {
+                let _ = app.emit("transcription-cancelled", ());
+                return Ok(());
             };
+            let model_missing = matches!(eff.llm_backend, LlmBackend::Groq)
+                && outcome
+                    .error
+                    .as_deref()
+                    .is_some_and(crate::groq::is_model_missing);
+            if model_missing {
+                let failed = eff.groq_llm_model.clone();
+                let Some(next) = cancellable(crate::groq::recover_model(state, &failed)).await
+                else {
+                    let _ = app.emit("transcription-cancelled", ());
+                    return Ok(());
+                };
+                if let Some(model) = next {
+                    let mut retry: Settings = (*eff).clone();
+                    retry.groq_llm_model = model;
+                    let Some(again) = cancellable(state.llm.cleanup(&retry, &processed)).await
+                    else {
+                        let _ = app.emit("transcription-cancelled", ());
+                        return Ok(());
+                    };
+                    outcome = again;
+                }
+            }
             tracing::info!("llm cleanup took {} ms", llm_start.elapsed().as_millis());
             let issue = outcome.error.map(|message| {
                 if outcome.timed_out {
@@ -464,6 +478,20 @@ async fn run_pipeline(
     }
 
     Ok(())
+}
+
+async fn cancellable<F: std::future::Future>(future: F) -> Option<F::Output> {
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            out = &mut future => return Some(out),
+            _ = tokio::time::sleep(Duration::from_millis(120)) => {
+                if CANCEL.load(Ordering::Acquire) {
+                    return None;
+                }
+            }
+        }
+    }
 }
 
 enum LlmGate {

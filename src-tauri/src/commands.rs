@@ -445,6 +445,19 @@ pub async fn test_llm(state: State<'_, SharedState>) -> Result<String, String> {
 }
 
 #[tauri::command]
+pub async fn groq_models(
+    state: State<'_, SharedState>,
+    refresh: bool,
+) -> Result<crate::groq::GroqModels, String> {
+    let shared = state.inner().clone();
+    if refresh {
+        Ok(crate::groq::refresh(&shared).await)
+    } else {
+        Ok(crate::groq::cached())
+    }
+}
+
+#[tauri::command]
 pub fn autostart_status(app: AppHandle) -> AutostartStatus {
     autostart::status(&app)
 }

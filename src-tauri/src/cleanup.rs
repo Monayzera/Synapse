@@ -1,5 +1,6 @@
 use crate::config::{LlmBackend, Settings};
 use crate::error::{AppError, AppResult};
+use crate::groq::GroqModel;
 use serde_json::{json, Value};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -36,32 +37,49 @@ fn estimate_tokens(s: &str) -> u32 {
     (s.len() / 4) as u32 + 1
 }
 
-fn groq_tpm_limit(model: &str) -> u32 {
-    match model {
-        "meta-llama/llama-4-scout-17b-16e-instruct" => 30000,
-        "llama-3.3-70b-versatile" => 12000,
-        "openai/gpt-oss-120b" | "openai/gpt-oss-20b" => 8000,
-        _ => 6000,
+const GROQ_MAX_OUTPUT: u32 = 4096;
+const GROQ_REASONING_OUTPUT: u32 = 8192;
+const GROQ_UNKNOWN_BUDGET: u32 = 6000;
+
+fn groq_max_tokens(info: Option<&GroqModel>, system: &str, raw: &str) -> u32 {
+    match info {
+        Some(model) => {
+            let cap = if model.reasoning {
+                GROQ_REASONING_OUTPUT
+            } else {
+                GROQ_MAX_OUTPUT
+            };
+            model
+                .max_completion_tokens
+                .map_or(cap, |max| max.min(cap))
+                .max(256)
+        }
+        None => {
+            let input = estimate_tokens(system) + estimate_tokens(raw);
+            GROQ_UNKNOWN_BUDGET
+                .saturating_sub(input + 512)
+                .clamp(256, GROQ_MAX_OUTPUT)
+        }
     }
 }
 
-fn groq_max_tokens(model: &str, system: &str, raw: &str) -> u32 {
-    let tpm = groq_tpm_limit(model);
-    let input = estimate_tokens(system) + estimate_tokens(raw);
-    tpm.saturating_sub(input + 512).clamp(256, 4096)
-}
-
-fn groq_reasoning_format(model: &str) -> Option<&'static str> {
-    const REASONING: [&str; 3] = [
-        "qwen/qwen3-32b",
-        "openai/gpt-oss-120b",
-        "openai/gpt-oss-20b",
-    ];
-    if REASONING.contains(&model) {
+fn groq_reasoning_format(info: Option<&GroqModel>) -> Option<&'static str> {
+    if info.is_some_and(|model| model.reasoning) {
         Some("parsed")
     } else {
         None
     }
+}
+
+fn groq_truncated(value: &Value, info: Option<&GroqModel>) -> bool {
+    if value.pointer("/choices/0/finish_reason").and_then(Value::as_str) == Some("length") {
+        return true;
+    }
+    let Some(context) = info.and_then(|model| model.context_window) else {
+        return false;
+    };
+    let tokens = |path: &str| value.pointer(path).and_then(Value::as_u64).unwrap_or(0);
+    tokens("/usage/prompt_tokens") + tokens("/usage/completion_tokens") >= u64::from(context)
 }
 
 fn marker_re() -> &'static regex::Regex {
@@ -156,7 +174,8 @@ impl LlmClient {
             timeout_ms = timeout_ms.max(8000);
         }
         if matches!(settings.llm_backend, LlmBackend::Groq) {
-            let floor = if groq_reasoning_format(settings.groq_llm_model.trim()).is_some() {
+            let info = crate::groq::model_info(&settings.groq_llm_model);
+            let floor = if groq_reasoning_format(info.as_ref()).is_some() {
                 25000
             } else {
                 15000
@@ -207,19 +226,40 @@ impl LlmClient {
             LlmBackend::Groq => {
                 let key = settings.groq_llm_api_key.trim();
                 let model = settings.groq_llm_model.trim();
-                let max_tokens = groq_max_tokens(model, system, &fenced);
-                self.openai_chat(
-                    GROQ_BASE,
-                    model,
-                    key,
-                    system,
-                    &fenced,
-                    settings.llm_temperature,
-                    max_tokens,
-                    false,
-                    groq_reasoning_format(model),
-                )
-                .await
+                let info = crate::groq::model_info(model);
+                let max_tokens = groq_max_tokens(info.as_ref(), system, &fenced);
+                let reasoning = groq_reasoning_format(info.as_ref());
+                let temperature = settings.llm_temperature;
+                let user = fenced.as_str();
+                let request = move |format: Option<&'static str>| {
+                    self.openai_value(
+                        GROQ_BASE,
+                        model,
+                        key,
+                        system,
+                        user,
+                        temperature,
+                        max_tokens,
+                        false,
+                        format,
+                    )
+                };
+                let value = match request(reasoning).await {
+                    Err(AppError::Llm(message))
+                        if reasoning.is_some() && message.contains("reasoning_format") =>
+                    {
+                        tracing::warn!(
+                            "groq rejected reasoning_format for {model}; retrying without it"
+                        );
+                        request(None).await
+                    }
+                    other => other,
+                }?;
+                if groq_truncated(&value, info.as_ref()) {
+                    return Err(AppError::Llm("the AI response was cut off".to_string()));
+                }
+                extract_openai(&value)
+                    .ok_or_else(|| AppError::Llm("unexpected response shape".to_string()))
             }
             _ => {
                 let send_thinking =
@@ -253,6 +293,35 @@ impl LlmClient {
         enable_thinking_kwarg: bool,
         reasoning_format: Option<&str>,
     ) -> AppResult<String> {
+        let value = self
+            .openai_value(
+                base,
+                model,
+                api_key,
+                system,
+                raw,
+                temperature,
+                max_tokens,
+                enable_thinking_kwarg,
+                reasoning_format,
+            )
+            .await?;
+        extract_openai(&value).ok_or_else(|| AppError::Llm("unexpected response shape".to_string()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn openai_value(
+        &self,
+        base: &str,
+        model: &str,
+        api_key: &str,
+        system: &str,
+        raw: &str,
+        temperature: f32,
+        max_tokens: u32,
+        enable_thinking_kwarg: bool,
+        reasoning_format: Option<&str>,
+    ) -> AppResult<Value> {
         let base = base.trim_end_matches('/');
         let url = format!("{base}/chat/completions");
 
@@ -282,8 +351,7 @@ impl LlmClient {
             .send()
             .await
             .map_err(|e| AppError::Llm(e.to_string()))?;
-        let value = read_json(response).await?;
-        extract_openai(&value).ok_or_else(|| AppError::Llm("unexpected response shape".to_string()))
+        read_json(response).await
     }
 
     async fn anthropic(&self, settings: &Settings, system: &str, raw: &str) -> AppResult<String> {
@@ -451,5 +519,66 @@ mod tests {
     fn format_disabled_leaves_prompt_unchanged() {
         let out = apply_format(SYSTEM_PROMPT.to_string(), SINGLE_LINE_RULE_CORR, false);
         assert_eq!(out, SYSTEM_PROMPT);
+    }
+
+    fn groq_model(reasoning: bool, max_completion_tokens: Option<u32>) -> GroqModel {
+        GroqModel {
+            id: "vendor/model".to_string(),
+            label: "model".to_string(),
+            reasoning,
+            context_window: Some(131072),
+            max_completion_tokens,
+            created: 0,
+        }
+    }
+
+    #[test]
+    fn groq_output_limit_follows_the_catalog() {
+        let short = "hello";
+        assert_eq!(groq_max_tokens(Some(&groq_model(false, Some(65536))), SYSTEM_PROMPT, short), 4096);
+        assert_eq!(groq_max_tokens(Some(&groq_model(false, Some(1024))), SYSTEM_PROMPT, short), 1024);
+        assert_eq!(groq_max_tokens(Some(&groq_model(false, Some(100))), SYSTEM_PROMPT, short), 256);
+        assert_eq!(groq_max_tokens(Some(&groq_model(false, None)), SYSTEM_PROMPT, short), 4096);
+    }
+
+    #[test]
+    fn groq_reasoning_models_get_more_room() {
+        let short = "hello";
+        assert_eq!(groq_max_tokens(Some(&groq_model(true, Some(65536))), SYSTEM_PROMPT, short), 8192);
+        assert_eq!(groq_max_tokens(Some(&groq_model(true, Some(4096))), SYSTEM_PROMPT, short), 4096);
+        assert_eq!(groq_max_tokens(Some(&groq_model(true, None)), SYSTEM_PROMPT, short), 8192);
+    }
+
+    #[test]
+    fn groq_unknown_model_keeps_the_token_budget() {
+        assert_eq!(groq_max_tokens(None, "", "hi"), 4096);
+        assert_eq!(groq_max_tokens(None, "", &"x".repeat(16000)), 1486);
+        assert_eq!(groq_max_tokens(None, "", &"x".repeat(40000)), 256);
+    }
+
+    #[test]
+    fn groq_cut_off_replies_are_detected() {
+        let small = GroqModel {
+            context_window: Some(4096),
+            ..groq_model(false, Some(4096))
+        };
+        let reply = |finish: &str, prompt: u64, completion: u64| {
+            json!({
+                "choices": [{ "finish_reason": finish, "message": { "content": "text" } }],
+                "usage": { "prompt_tokens": prompt, "completion_tokens": completion }
+            })
+        };
+        assert!(groq_truncated(&reply("length", 100, 50), None));
+        assert!(groq_truncated(&reply("stop", 3184, 913), Some(&small)));
+        assert!(!groq_truncated(&reply("stop", 639, 60), Some(&small)));
+        assert!(!groq_truncated(&reply("stop", 3184, 913), None));
+        assert!(!groq_truncated(&json!({ "choices": [] }), Some(&small)));
+    }
+
+    #[test]
+    fn groq_reasoning_format_only_for_reasoning_models() {
+        assert_eq!(groq_reasoning_format(Some(&groq_model(true, None))), Some("parsed"));
+        assert_eq!(groq_reasoning_format(Some(&groq_model(false, None))), None);
+        assert_eq!(groq_reasoning_format(None), None);
     }
 }

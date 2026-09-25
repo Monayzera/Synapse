@@ -33,7 +33,7 @@ impl AccessibilityIssue {
 
     fn message(self) -> &'static str {
         match self {
-            AccessibilityIssue::Missing => "Allow Synapse in System Settings > Privacy & Security > Accessibility. The global shortcut starts working as soon as you enable it.",
+            AccessibilityIssue::Missing => "Allow Synapse in System Settings > Privacy & Security > Accessibility. If it is already enabled, remove it with the minus button and add it again.",
             AccessibilityIssue::Stale => "macOS is blocking the global shortcut even though Accessibility looks enabled (stale permission from a previous build). In System Settings > Privacy & Security > Accessibility, remove Synapse with the minus button, add it again and turn it on.",
         }
     }

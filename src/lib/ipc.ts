@@ -18,6 +18,7 @@ import type {
   SectionId,
   UpdateNotice,
   UpdateStatus,
+  GroqModels,
 } from "./types";
 
 export const api = {
@@ -66,6 +67,7 @@ export const api = {
   reloadEngine: () => invoke<void>("reload_engine"),
   restartLlm: () => invoke<void>("restart_llm"),
   testLlm: () => invoke<string>("test_llm"),
+  groqModels: (refresh: boolean) => invoke<GroqModels>("groq_models", { refresh }),
   autostartStatus: () => invoke<AutostartStatus>("autostart_status"),
   setAutostart: (enabled: boolean) => invoke<AutostartStatus>("set_autostart", { enabled }),
   openPrivacySettings: (kind: PrivacyKind) => invoke<void>("open_privacy_settings", { kind }),

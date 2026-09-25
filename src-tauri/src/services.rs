@@ -342,6 +342,10 @@ pub fn apply_settings_change(app: &AppHandle, state: &SharedState, old: &Setting
         load_engine_supervised(state);
     }
 
+    if old.groq_llm_api_key != new.groq_llm_api_key {
+        crate::groq::spawn_refresh(state);
+    }
+
     if llm_changed(old, new) {
         let sidecar_state = state.clone();
         tauri::async_runtime::spawn(async move {
@@ -478,6 +482,8 @@ pub fn bootstrap(app: &AppHandle, state: &SharedState, migrated: bool) {
     }
 
     state.reload_vad();
+
+    crate::groq::init(state);
 
     let settings = state.settings_snapshot();
     if settings.transcription_backend == TranscriptionBackend::Groq {

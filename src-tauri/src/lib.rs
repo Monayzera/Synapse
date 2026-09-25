@@ -144,6 +144,7 @@ pub fn run() {
             commands::reload_engine,
             commands::restart_llm,
             commands::test_llm,
+            commands::groq_models,
             commands::autostart_status,
             commands::set_autostart,
             commands::open_settings,
