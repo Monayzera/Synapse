@@ -128,7 +128,7 @@ async fn start_sidecar(
         return false;
     }
     let log_path = state.log_dir.join("llama-server.log");
-    let child = match Sidecar::spawn(exe, model, port, gpu_layers, 2048, &log_path) {
+    let child = match Sidecar::spawn(exe, model, port, gpu_layers, 4096, &log_path) {
         Ok(child) => child,
         Err(err) => {
             tracing::warn!("could not start llama-server: {err}");

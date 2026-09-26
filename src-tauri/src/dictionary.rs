@@ -116,7 +116,19 @@ fn normalize(text: &str) -> String {
 }
 
 pub fn word_count(text: &str) -> i64 {
-    text.split_whitespace().filter(|w| !w.is_empty()).count() as i64
+    text.lines()
+        .map(|line| {
+            let line = line.trim_start();
+            let line = line.strip_prefix("\u{2022} ").unwrap_or(line);
+            let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+            let line = if (1..=2).contains(&digits) && line[digits..].starts_with(". ") {
+                &line[digits + 2..]
+            } else {
+                line
+            };
+            line.split_whitespace().count()
+        })
+        .sum::<usize>() as i64
 }
 
 #[cfg(test)]
@@ -164,5 +176,16 @@ mod tests {
     fn disabled_removal_keeps_text() {
         let out = process("uh ok", false, &words(&["uh"]), &BTreeMap::new());
         assert_eq!(out, "uh ok");
+    }
+
+    #[test]
+    fn word_count_ignores_list_markers() {
+        assert_eq!(word_count("um dois  tr\u{ea}s"), 3);
+        assert_eq!(
+            word_count("Preciso comprar:\n\u{2022} Arroz\n\u{2022} Feij\u{e3}o preto\n1. Abrir o app\n10. Fim"),
+            9
+        );
+        assert_eq!(word_count("O ano 2020. Foi bom"), 5);
+        assert_eq!(word_count(""), 0);
     }
 }

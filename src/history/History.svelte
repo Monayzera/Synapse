@@ -413,6 +413,7 @@
     line-height: 1.5;
     color: var(--ink);
     overflow-wrap: anywhere;
+    white-space: pre-wrap;
   }
 
   .raw {

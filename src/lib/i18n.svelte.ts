@@ -149,7 +149,7 @@ const en = {
 
   "ai.correct": "Correct text",
   "ai.translate": "Translate to",
-  "ai.paragraphs": "Organize into paragraphs",
+  "ai.paragraphs": "Smart formatting",
   "ai.provider": "Provider",
   "ai.local": "Local",
   "ai.groq": "Groq",
@@ -450,7 +450,7 @@ const pt: Record<TKey, string> = {
 
   "ai.correct": "Corrigir texto",
   "ai.translate": "Traduzir para",
-  "ai.paragraphs": "Organizar em parágrafos",
+  "ai.paragraphs": "Formatação inteligente",
   "ai.provider": "Provedor",
   "ai.local": "Local",
   "ai.groq": "Groq",

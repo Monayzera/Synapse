@@ -42,7 +42,7 @@ pub fn inject_text(text: &str, restore_clipboard: bool, paste_delay_ms: u64) -> 
 
     let previous = clipboard.get_text().ok();
 
-    set_clipboard_with_retry(&mut clipboard, text)?;
+    set_clipboard_with_retry(&mut clipboard, &platform_text(text))?;
 
     send_paste()?;
 
@@ -126,5 +126,31 @@ fn send_paste() -> AppResult<()> {
 pub fn copy_to_clipboard(text: &str) -> AppResult<()> {
     let mut clipboard =
         Clipboard::new().map_err(|e| AppError::Inject(format!("clipboard open failed: {e}")))?;
-    set_clipboard_with_retry(&mut clipboard, text)
+    set_clipboard_with_retry(&mut clipboard, &platform_text(text))
+}
+
+#[cfg(windows)]
+fn platform_text(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains('\n') {
+        std::borrow::Cow::Owned(text.replace("\r\n", "\n").replace('\n', "\r\n"))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
+#[cfg(not(windows))]
+fn platform_text(text: &str) -> std::borrow::Cow<'_, str> {
+    std::borrow::Cow::Borrowed(text)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::platform_text;
+
+    #[test]
+    fn windows_paste_uses_crlf() {
+        assert_eq!(platform_text("a\nb"), "a\r\nb");
+        assert_eq!(platform_text("a\r\nb\n\nc"), "a\r\nb\r\n\r\nc");
+        assert_eq!(platform_text("one line"), "one line");
+    }
 }
