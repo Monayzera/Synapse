@@ -1,7 +1,7 @@
 {
   "name": "synapse",
   "private": true,
-  "version": "1.0.1",
+  "version": "1.0.2",
   "type": "module",
   "description": "Synapse - offline voice dictation with Whisper and local LLM cleanup",
   "scripts": {
