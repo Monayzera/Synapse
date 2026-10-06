@@ -19,6 +19,8 @@ import type {
   UpdateNotice,
   UpdateStatus,
   GroqModels,
+  LocalAiStatus,
+  TestReport,
 } from "./types";
 
 export const api = {
@@ -63,10 +65,12 @@ export const api = {
   deleteModel: (id: string) => invoke<void>("delete_model", { id }),
   setupLlamaAuto: () => invoke<void>("setup_llama_auto"),
   llamaStatus: () => invoke<LlamaStatus>("llama_status"),
+  localAiStatus: () => invoke<LocalAiStatus>("local_ai_status"),
+  repairLocalAi: () => invoke<void>("repair_local_ai"),
   hardwareInfo: () => invoke<HardwareInfo>("hardware_info"),
   reloadEngine: () => invoke<void>("reload_engine"),
   restartLlm: () => invoke<void>("restart_llm"),
-  testLlm: () => invoke<string>("test_llm"),
+  testLlm: () => invoke<TestReport>("test_llm"),
   groqModels: (refresh: boolean) => invoke<GroqModels>("groq_models", { refresh }),
   autostartStatus: () => invoke<AutostartStatus>("autostart_status"),
   setAutostart: (enabled: boolean) => invoke<AutostartStatus>("set_autostart", { enabled }),

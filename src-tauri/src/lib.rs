@@ -155,6 +155,8 @@ pub fn run() {
             commands::delete_model,
             commands::setup_llama_auto,
             commands::llama_status,
+            commands::local_ai_status,
+            commands::repair_local_ai,
             hardware::hardware_info,
             hf::hf_detect,
             hf::hf_list_files,
@@ -270,6 +272,7 @@ fn setup(app: &mut tauri::App, autostart_launch: bool, log_dir: PathBuf) {
     };
 
     let ui_language = settings.ui_language.clone();
+    let llama_backend = llama_setup::read_backend(&bin_dir);
     let state: SharedState = Arc::new(AppState {
         app: handle.clone(),
         config_path,
@@ -280,6 +283,14 @@ fn setup(app: &mut tauri::App, autostart_launch: bool, log_dir: PathBuf) {
         custom_models: RwLock::new(custom_store),
         custom_models_path,
         llama_setup_running: AtomicBool::new(false),
+        llama_restart_pending: Mutex::new(false),
+        llama_backend: RwLock::new(llama_backend),
+        local_ai_repairable: AtomicBool::new(false),
+        local_ai_error: RwLock::new(None),
+        local_ai_last: Mutex::new(None),
+        local_ai_files: Mutex::new(None),
+        gpu_fallback: Mutex::new(None),
+        llama_files: tokio::sync::Mutex::new(()),
         settings: RwLock::new(settings),
         settings_io: Mutex::new(()),
         audio,

@@ -2,13 +2,14 @@ use crate::audio::AudioEngine;
 use crate::cleanup::LlmClient;
 use crate::config::{LlmBackend, Settings, TranscriptionBackend};
 use crate::error::{AppError, AppResult};
+use crate::llama_setup::BackendInfo;
 use crate::sidecar::Sidecar;
 use crate::transcribe::TranscribeEngine;
 use crate::vad::Vad;
 use crate::{history, models};
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
@@ -54,6 +55,19 @@ impl LlmState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LocalAiStatus {
+    pub state: LlmState,
+    pub installed: bool,
+    pub model_present: bool,
+    pub variant: Option<String>,
+    pub device: Option<String>,
+    pub device_name: Option<String>,
+    pub repairable: bool,
+    pub setup_running: bool,
+    pub last_error: Option<String>,
+}
+
 #[derive(Default)]
 pub struct EngineMeta {
     pub loaded_model: String,
@@ -92,6 +106,14 @@ pub struct AppState {
     pub custom_models: RwLock<crate::custom_models::CustomStore>,
     pub custom_models_path: PathBuf,
     pub llama_setup_running: AtomicBool,
+    pub llama_restart_pending: Mutex<bool>,
+    pub llama_backend: RwLock<Option<BackendInfo>>,
+    pub local_ai_repairable: AtomicBool,
+    pub local_ai_error: RwLock<Option<String>>,
+    pub local_ai_last: Mutex<Option<LocalAiStatus>>,
+    pub local_ai_files: Mutex<Option<(bool, bool)>>,
+    pub gpu_fallback: Mutex<Option<PathBuf>>,
+    pub llama_files: tokio::sync::Mutex<()>,
     pub settings: RwLock<Settings>,
     pub settings_io: Mutex<()>,
     pub audio: Arc<AudioEngine>,
@@ -305,6 +327,152 @@ impl AppState {
         if let Err(err) = self.app.emit("status-changed", payload) {
             tracing::warn!("status-changed emit failed: {err}");
         }
+        self.emit_local_ai_status();
+    }
+
+    pub fn local_ai_gpu(&self) -> bool {
+        let layers = self.settings.read().llm_gpu_layers;
+        if layers <= 0 || self.gpu_fallback_active() {
+            return false;
+        }
+        if cfg!(target_os = "macos") {
+            return true;
+        }
+        self.llama_backend
+            .read()
+            .as_ref()
+            .is_some_and(BackendInfo::gpu_ready)
+    }
+
+    pub fn gpu_fallback_for(&self, model: &Path) -> bool {
+        self.gpu_fallback.lock().as_deref() == Some(model)
+    }
+
+    fn gpu_fallback_active(&self) -> bool {
+        let model_file = self.settings.read().llm_local_model.clone();
+        self.gpu_fallback_for(&models::model_path(&self.models_dir, &model_file))
+    }
+
+    pub fn set_gpu_fallback(&self, model: Option<PathBuf>) {
+        *self.gpu_fallback.lock() = model;
+        self.emit_local_ai_status();
+    }
+
+    fn scan_local_ai_files(&self) -> (bool, bool) {
+        let model_file = self.settings.read().llm_local_model.clone();
+        let installed = self.sidecar_binary().exists();
+        let model_present = std::fs::metadata(models::model_path(&self.models_dir, &model_file))
+            .map(|meta| meta.len() > 1_000_000)
+            .unwrap_or(false);
+        *self.local_ai_files.lock() = Some((installed, model_present));
+        (installed, model_present)
+    }
+
+    fn local_ai_files(&self) -> (bool, bool) {
+        let cached = *self.local_ai_files.lock();
+        match cached {
+            Some(files) => files,
+            None => self.scan_local_ai_files(),
+        }
+    }
+
+    pub fn refresh_local_ai_files(&self) {
+        self.scan_local_ai_files();
+        self.emit_local_ai_status();
+    }
+
+    pub fn local_ai_status(&self) -> LocalAiStatus {
+        let (installed, model_present) = self.local_ai_files();
+        let backend = self.llama_backend.read().clone();
+        let gpu = self.local_ai_gpu();
+        let fallback = cfg!(windows) && self.gpu_fallback_active();
+        let device = if !installed {
+            None
+        } else if gpu {
+            Some("gpu".to_string())
+        } else {
+            Some("cpu".to_string())
+        };
+        let device_name = if installed && gpu {
+            backend.as_ref().and_then(|info| info.gpu_name.clone())
+        } else {
+            None
+        };
+        LocalAiStatus {
+            state: self.local_llm_state(),
+            installed,
+            model_present,
+            variant: backend.map(|info| info.variant),
+            device,
+            device_name,
+            repairable: installed
+                && (fallback || self.local_ai_repairable.load(Ordering::Acquire)),
+            setup_running: self.llama_setup_running.load(Ordering::Acquire),
+            last_error: self.local_ai_error.read().clone(),
+        }
+    }
+
+    pub fn emit_local_ai_status(&self) {
+        let mut last = self.local_ai_last.lock();
+        let status = self.local_ai_status();
+        if last.as_ref() == Some(&status) {
+            return;
+        }
+        if let Err(err) = self.app.emit("local-ai-status", status.clone()) {
+            tracing::warn!("local-ai-status emit failed: {err}");
+        }
+        *last = Some(status);
+    }
+
+    pub fn set_local_ai_error(&self, error: Option<String>) {
+        *self.local_ai_error.write() = error;
+        self.emit_local_ai_status();
+    }
+
+    pub fn set_llama_backend(&self, info: Option<BackendInfo>) {
+        *self.llama_backend.write() = info;
+        self.emit_local_ai_status();
+    }
+
+    pub fn adopt_llama_backend(
+        &self,
+        expected: Option<&BackendInfo>,
+        info: Option<BackendInfo>,
+    ) -> bool {
+        {
+            let mut slot = self.llama_backend.write();
+            if slot.as_ref() != expected {
+                return false;
+            }
+            *slot = info;
+        }
+        self.emit_local_ai_status();
+        true
+    }
+
+    pub fn begin_llama_setup(&self) -> bool {
+        let mut pending = self.llama_restart_pending.lock();
+        if self.llama_setup_running.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        *pending = false;
+        true
+    }
+
+    pub fn defer_llama_restart(&self) -> bool {
+        let mut pending = self.llama_restart_pending.lock();
+        if self.llama_setup_running.load(Ordering::Acquire) {
+            *pending = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn finish_llama_setup(&self) -> bool {
+        let mut pending = self.llama_restart_pending.lock();
+        self.llama_setup_running.store(false, Ordering::Release);
+        std::mem::take(&mut *pending)
     }
 
     fn set_engine_failure(&self, model: &str, missing: bool, message: String, status: Status) {
@@ -412,7 +580,6 @@ impl AppState {
         &self,
         samples: &[f32],
         language: Option<&str>,
-        translate: bool,
     ) -> AppResult<(String, bool)> {
         let guard = loop {
             if crate::pipeline::CANCEL.load(Ordering::Acquire) {
@@ -435,7 +602,7 @@ impl AppState {
         let cap = if engine.on_gpu { 4 } else { 6 };
         let threads = (logical / 2).max(1).min(cap) as i32;
         let prompt = self.vocabulary_prompt();
-        let text = engine.transcribe(samples, language, threads, prompt.as_deref(), translate)?;
+        let text = engine.transcribe(samples, language, threads, prompt.as_deref())?;
         Ok((text, engine.on_gpu))
     }
 

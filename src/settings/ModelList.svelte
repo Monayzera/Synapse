@@ -57,7 +57,7 @@
     return fmtBytes(m.info.size_bytes > 0 ? m.info.size_bytes : m.actual_bytes);
   }
 
-  function activeLabel(): { text: string; tone: "ok" | "busy" | "bad" } {
+  function activeLabel(): { text: string; tone: "ok" | "busy" | "bad" | "off" } {
     const st = app.status;
     if (kind === "whisper") {
       if (st?.status === "loading" || st?.error_code === "engine_loading") {
@@ -67,8 +67,10 @@
       return { text: t("model.active"), tone: "ok" };
     }
     if (app.settings?.llm_backend === "local") {
-      if (st?.llm === "starting") return { text: t("model.starting"), tone: "busy" };
-      if (st?.llm === "failed") return { text: t("model.failed"), tone: "bad" };
+      const llm = app.localAi?.state ?? st?.llm;
+      if (llm === "off") return { text: t("model.off"), tone: "off" };
+      if (llm === "starting") return { text: t("model.starting"), tone: "busy" };
+      if (llm === "failed") return { text: t("model.failed"), tone: "bad" };
     }
     return { text: t("model.active"), tone: "ok" };
   }
@@ -198,3 +200,10 @@
     </div>
   {/each}
 </div>
+
+<style>
+  .state-pill[data-tone="off"] {
+    color: var(--ink-faint);
+    background: var(--paper-sunk);
+  }
+</style>

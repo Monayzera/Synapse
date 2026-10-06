@@ -11,8 +11,11 @@ import type {
   SectionId,
   UpdateStatus,
   GroqModels,
+  LocalAiStatus,
+  LlmState,
+  TestReport,
 } from "../lib/types";
-import { tOr, locale } from "../lib/i18n.svelte";
+import { t, tOr, tTest, locale } from "../lib/i18n.svelte";
 
 export const SECTIONS: SectionId[] = ["general", "voice", "ai", "dictionary", "advanced", "about"];
 
@@ -36,7 +39,7 @@ const DEFAULTS: Settings = {
   transcription_backend: "local",
   groq_api_key: "",
   groq_model: "whisper-large-v3-turbo",
-  groq_llm_model: "qwen/qwen3.8-27b",
+  groq_llm_model: "openai/gpt-oss-20b",
   groq_llm_api_key: "",
   audio_device: null,
   vad_enabled: true,
@@ -79,6 +82,7 @@ export const app = $state({
   hw: null as HardwareInfo | null,
   status: null as StatusPayload | null,
   llama: null as LlamaStatus | null,
+  localAi: null as LocalAiStatus | null,
   llamaProgress: null as LlamaSetupProgress | null,
   llamaRunning: false,
   autostart: null as AutostartStatus | null,
@@ -248,6 +252,53 @@ export function refreshLlama() {
     .catch(() => {});
 }
 
+const LLM_STATES: LlmState[] = ["off", "starting", "ready", "failed"];
+let localAiSeq = 0;
+
+function textOrNull(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function adoptLocalAi(raw: unknown) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
+  const r = raw as Record<string, unknown>;
+  const state = r.state;
+  if (typeof state !== "string" || !(LLM_STATES as string[]).includes(state)) return;
+  const device = r.device;
+  const previous = app.localAi?.state ?? null;
+  const setupRunning = r.setup_running === true;
+  app.localAi = {
+    state: state as LlmState,
+    installed: r.installed === true,
+    model_present: r.model_present === true,
+    variant: textOrNull(r.variant),
+    device: device === "gpu" || device === "cpu" ? device : null,
+    device_name: textOrNull(r.device_name),
+    repairable: r.repairable === true,
+    setup_running: setupRunning,
+    last_error: textOrNull(r.last_error),
+  };
+  if (
+    previous !== state &&
+    (state === "starting" || state === "ready") &&
+    !setupRunning &&
+    !app.llamaRunning &&
+    app.llamaProgress?.error
+  ) {
+    app.llamaProgress = null;
+  }
+}
+
+export function refreshLocalAi() {
+  const seq = localAiSeq;
+  api
+    .localAiStatus()
+    .then((s) => {
+      if (seq === localAiSeq) adoptLocalAi(s);
+    })
+    .catch(() => {});
+}
+
 export function refreshDevices() {
   api
     .listAudioDevices()
@@ -344,31 +395,87 @@ export function adoptSettings(raw: unknown) {
   applyRemote(raw, true);
 }
 
-export async function testLlm(): Promise<{ ok: boolean; detail: string }> {
+function asTestReport(raw: unknown): TestReport | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.ok !== "boolean") return null;
+  const params =
+    r.params && typeof r.params === "object" && !Array.isArray(r.params)
+      ? (r.params as TestReport["params"])
+      : {};
+  return {
+    ok: r.ok,
+    text: typeof r.text === "string" ? r.text : "",
+    ms: typeof r.ms === "number" && Number.isFinite(r.ms) && r.ms >= 0 ? r.ms : 0,
+    model: typeof r.model === "string" ? r.model : "",
+    code: typeof r.code === "string" && r.code ? r.code : null,
+    params,
+    detail: typeof r.detail === "string" ? r.detail : "",
+  };
+}
+
+export function testOkLabel(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return t("ai.testOk");
+  return t("ai.testOkTime", {
+    s: (ms / 1000).toLocaleString(locale(), { minimumFractionDigits: 1, maximumFractionDigits: 1 }),
+  });
+}
+
+export async function testLlm(): Promise<{
+  ok: boolean;
+  detail: string;
+  title?: string;
+  report: TestReport | null;
+}> {
   await flush();
   try {
-    const out = await api.testLlm();
-    return { ok: true, detail: typeof out === "string" ? out : "" };
+    const out: unknown = await api.testLlm();
+    const report = asTestReport(out);
+    if (!report) {
+      const legacy = typeof out === "string";
+      return { ok: legacy, detail: legacy ? out : "", report: null };
+    }
+    if (report.ok) return { ok: true, detail: report.text, report };
+    const raw = report.text.trim() || report.code || "";
+    const detail = report.code ? tTest(report.code, report.params, raw) : raw;
+    const title = report.detail.trim() || undefined;
+    return { ok: false, detail, title, report };
   } catch (e) {
-    return { ok: false, detail: describeError(e) };
+    const raw = describeError(e).trim();
+    return { ok: false, detail: /^[a-z_]+$/.test(raw) ? tTest(raw, null, raw) : raw, report: null };
   }
+}
+
+const SETUP_BUSY = "Setup already in progress.";
+
+function setupRejected(e: unknown) {
+  const detail = describeError(e);
+  if (detail.trim() === SETUP_BUSY) {
+    refreshLocalAi();
+    return;
+  }
+  app.llamaRunning = false;
+  app.llamaProgress = {
+    stage: "configure_start",
+    pct: 0,
+    overall_pct: 0,
+    message: detail,
+    done: false,
+    error: detail,
+  };
+  refreshLocalAi();
+}
+
+export function repairLocalAi() {
+  app.llamaRunning = true;
+  app.llamaProgress = null;
+  api.repairLocalAi().catch(setupRejected);
 }
 
 export function startLlamaSetup() {
   app.llamaRunning = true;
   app.llamaProgress = null;
-  api.setupLlamaAuto().catch((e) => {
-    app.llamaRunning = false;
-    const detail = describeError(e);
-    app.llamaProgress = {
-      stage: "configure_start",
-      pct: 0,
-      overall_pct: 0,
-      message: detail,
-      done: false,
-      error: detail,
-    };
-  });
+  api.setupLlamaAuto().catch(setupRejected);
 }
 
 export function markDownloadStart(id: string) {
@@ -425,6 +532,7 @@ export function start(): () => void {
     refreshDevices();
     refreshStatus();
     refreshLlama();
+    refreshLocalAi();
     refreshUpdate();
   };
   window.addEventListener("blur", onBlur);
@@ -446,6 +554,12 @@ export function start(): () => void {
       }),
       on<StatusPayload>("status-changed", (e) => {
         if (e.payload && typeof e.payload === "object") app.status = e.payload;
+        refreshLlama();
+        refreshLocalAi();
+      }),
+      on<LocalAiStatus>("local-ai-status", (e) => {
+        localAiSeq++;
+        adoptLocalAi(e.payload);
       }),
       on<DownloadProgress>("model-download-progress", (e) => {
         const p = e.payload;
@@ -464,6 +578,7 @@ export function start(): () => void {
           app.llamaRunning = false;
           refreshModels();
           refreshLlama();
+          refreshLocalAi();
         } else {
           app.llamaRunning = true;
         }
@@ -471,6 +586,7 @@ export function start(): () => void {
       on("models-changed", () => {
         refreshModels();
         refreshLlama();
+        refreshLocalAi();
       }),
       on<UpdateStatus>("update-status", (e) => adoptUpdate(e.payload)),
       on<GroqModels>("groq-models", (e) => adoptGroq(e.payload)),
@@ -493,6 +609,7 @@ export function start(): () => void {
     refreshDevices();
     refreshModels();
     refreshLlama();
+    refreshLocalAi();
     refreshAutostart();
     refreshStatus();
     refreshUpdate();

@@ -317,7 +317,7 @@ impl Settings {
         }
     }
 
-    pub fn whisper_translate(&self) -> bool {
+    pub fn translation_to_english(&self) -> bool {
         self.translation_enabled && self.translation_target.trim().eq_ignore_ascii_case("english")
     }
 }

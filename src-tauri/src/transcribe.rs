@@ -110,7 +110,6 @@ impl TranscribeEngine {
         language: Option<&str>,
         n_threads: i32,
         initial_prompt: Option<&str>,
-        translate: bool,
     ) -> AppResult<String> {
         if samples.is_empty() {
             return Ok(String::new());
@@ -131,7 +130,7 @@ impl TranscribeEngine {
         };
         let mut params = FullParams::new(strategy);
         params.set_n_threads(n_threads.max(1));
-        params.set_translate(translate);
+        params.set_translate(false);
         params.set_language(language);
         params.set_temperature(0.0);
         params.set_temperature_inc(0.0);

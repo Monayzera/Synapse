@@ -12,6 +12,7 @@
     app,
     commit,
     testLlm,
+    testOkLabel,
     fmtBytes,
     describeError,
     refreshModels,
@@ -26,9 +27,17 @@
   let repoFiles = $state<HfFile[] | null>(null);
   let pending = $state<{ filename: string; url: string; size: number; kind: ModelKind } | null>(null);
   let added = $state<ModelKind | null>(null);
+  let testMs = $state(0);
 
   const num = (v: number, digits: number) =>
     v.toLocaleString(locale(), { minimumFractionDigits: digits, maximumFractionDigits: digits });
+
+  async function runTest(): Promise<{ ok: boolean; detail: string; title?: string }> {
+    testMs = 0;
+    const result = await testLlm();
+    if (result.ok) testMs = result.report?.ms ?? 0;
+    return result;
+  }
 
   async function restartAi(): Promise<{ ok: boolean; detail: string }> {
     try {
@@ -192,8 +201,8 @@
     <ActionButton
       label={t("adv.testConn")}
       busyLabel={t("ai.testing")}
-      okLabel={t("ai.testOk")}
-      action={testLlm}
+      okLabel={testOkLabel(testMs)}
+      action={runTest}
     />
     <ActionButton
       label={t("adv.restartAi")}

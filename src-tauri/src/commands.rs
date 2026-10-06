@@ -3,7 +3,7 @@ use crate::config::Settings;
 use crate::error::AppError;
 use crate::history::{HistoryEntry, Stats};
 use crate::models::ModelStatus;
-use crate::state::{SharedState, StatusPayload, SETTINGS_UNREADABLE};
+use crate::state::{LocalAiStatus, SharedState, StatusPayload, SETTINGS_UNREADABLE};
 use crate::{audio, history, inject, models, permissions, pipeline, services};
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -211,6 +211,9 @@ fn spawn_download(
         match models::download(&app_handle, &models_dir, &info).await {
             Ok(()) => {
                 tracing::info!("model {} downloaded", info.id);
+                if info.kind == models::ModelKind::Llm {
+                    shared.refresh_local_ai_files();
+                }
                 if activate {
                     if let Err(err) = services::activate_model(&shared, &info) {
                         tracing::warn!("downloaded model {} not activated: {err}", info.id);
@@ -373,6 +376,9 @@ pub async fn delete_model(
             .map_err(settings_error)?;
         shared.emit_settings_changed();
     }
+    if info.kind == models::ModelKind::Llm {
+        shared.refresh_local_ai_files();
+    }
     if reload_whisper {
         services::load_engine_supervised(&shared);
     }
@@ -386,8 +392,17 @@ pub async fn delete_model(
 
 #[tauri::command]
 pub fn setup_llama_auto(app: AppHandle, state: State<'_, SharedState>) -> Result<(), String> {
-    crate::llama_setup::launch(app, state.inner().clone());
-    Ok(())
+    crate::llama_setup::launch(app, state.inner().clone(), crate::llama_setup::SetupMode::Full)
+}
+
+#[tauri::command]
+pub fn repair_local_ai(app: AppHandle, state: State<'_, SharedState>) -> Result<(), String> {
+    crate::llama_setup::launch(app, state.inner().clone(), crate::llama_setup::SetupMode::Repair)
+}
+
+#[tauri::command]
+pub fn local_ai_status(state: State<'_, SharedState>) -> LocalAiStatus {
+    state.local_ai_status()
 }
 
 #[derive(serde::Serialize)]
@@ -438,10 +453,9 @@ pub async fn restart_llm(state: State<'_, SharedState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn test_llm(state: State<'_, SharedState>) -> Result<String, String> {
+pub async fn test_llm(state: State<'_, SharedState>) -> Result<crate::cleanup::TestReport, String> {
     let shared = state.inner().clone();
-    let settings = shared.settings_snapshot();
-    shared.llm.test(&settings).await.map_err(|e| e.to_string())
+    Ok(crate::cleanup::run_test(&shared).await)
 }
 
 #[tauri::command]

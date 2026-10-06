@@ -50,7 +50,10 @@ impl Sidecar {
             .arg(n_gpu_layers.to_string())
             .arg("--threads")
             .arg(threads().to_string())
-            .arg("--no-webui");
+            .arg("-np")
+            .arg("1")
+            .arg("--swa-full")
+            .arg("--no-ui");
 
         if let Some(dir) = exe.parent() {
             let current = std::env::var("PATH").unwrap_or_default();
@@ -137,28 +140,109 @@ pub async fn health_ok(client: &reqwest::Client, port: u16) -> bool {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    Alive,
+    Exited,
+    Superseded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Startup {
+    Ready,
+    Exited,
+    Superseded,
+    TimedOut,
+}
+
 pub async fn wait_until_ready<F>(
     client: &reqwest::Client,
     port: u16,
     timeout: Duration,
     mut alive: F,
-) -> bool
+) -> Startup
 where
-    F: FnMut() -> bool,
+    F: FnMut() -> Liveness,
 {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if !alive() {
-            tracing::warn!("llama-server exited while starting");
-            return false;
+        match alive() {
+            Liveness::Alive => {}
+            Liveness::Exited => {
+                tracing::warn!("llama-server exited while starting");
+                return Startup::Exited;
+            }
+            Liveness::Superseded => {
+                tracing::info!("llama-server start superseded by a newer restart");
+                return Startup::Superseded;
+            }
         }
         if health_ok(client, port).await {
-            return true;
+            return Startup::Ready;
         }
         if tokio::time::Instant::now() >= deadline {
-            return false;
+            return Startup::TimedOut;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+pub fn run_capture(mut command: Command, timeout: Duration) -> Result<String, String> {
+    use std::io::Read;
+
+    configure_no_window(&mut command);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().map_err(|e| format!("could not start: {e}"))?;
+    let (sender, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
+    match child.stdout.take() {
+        Some(mut stdout) => {
+            let reader = std::thread::Builder::new()
+                .name("synapse-capture".to_string())
+                .spawn(move || {
+                    let mut buffer = Vec::new();
+                    if let Err(err) = stdout.read_to_end(&mut buffer) {
+                        tracing::debug!("process output read failed: {err}");
+                    }
+                    let _ = sender.send(buffer);
+                });
+            if let Err(err) = reader {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("could not read the output: {err}"));
+            }
+        }
+        None => drop(sender),
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("status unavailable: {err}"));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("no answer within {} s", timeout.as_secs()));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let bytes = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_default();
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    if status.success() {
+        Ok(text)
+    } else {
+        let snippet: String = text.trim().chars().take(240).collect();
+        Err(format!("exited with {status}: {snippet}"))
     }
 }
 
@@ -185,8 +269,12 @@ fn open_log(path: &Path) -> std::io::Result<(std::fs::File, std::fs::File)> {
 
 fn threads() -> usize {
     std::thread::available_parallelism()
-        .map(|n| (n.get() / 2).max(2))
+        .map(|n| physical_estimate(n.get()))
         .unwrap_or(4)
+}
+
+fn physical_estimate(logical: usize) -> usize {
+    (logical / 2).max(2)
 }
 
 #[cfg(windows)]
@@ -229,3 +317,20 @@ fn configure_no_window(command: &mut Command) {
 
 #[cfg(not(windows))]
 fn configure_no_window(_command: &mut Command) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn physical_core_estimate_halves_logical_with_floor() {
+        assert_eq!(physical_estimate(16), 8);
+        assert_eq!(physical_estimate(12), 6);
+        assert_eq!(physical_estimate(8), 4);
+        assert_eq!(physical_estimate(5), 2);
+        assert_eq!(physical_estimate(4), 2);
+        assert_eq!(physical_estimate(2), 2);
+        assert_eq!(physical_estimate(1), 2);
+        assert_eq!(physical_estimate(0), 2);
+    }
+}

@@ -12,7 +12,7 @@
     UpdateNotice,
   } from "../lib/types";
   import Icon from "../lib/Icon.svelte";
-  import { t, tOr, setLanguage } from "../lib/i18n.svelte";
+  import { t, tOr, tCode, setLanguage } from "../lib/i18n.svelte";
 
   const BAR_COUNT = 18;
   const PILL_EDGE = 85;
@@ -272,8 +272,15 @@
     if (!payload || typeof payload !== "object") return "";
     const message = typeof payload.message === "string" ? payload.message : "";
     const code = typeof payload.code === "string" ? payload.code : "";
-    if (code) return tOr("err." + code, message || code);
+    const stage = typeof payload.stage === "string" ? payload.stage : "";
+    if (code) return tCode(code, payload.params, message || code, stage);
     return message;
+  }
+
+  function showPipelineError(payload: PipelineErrorPayload | string | null | undefined) {
+    const info = !!payload && typeof payload === "object" && payload.kind === "info";
+    if (info) showFlash(pipelineErrorText(payload), "ok", 4000);
+    else showFlash(pipelineErrorText(payload), "err");
   }
 
   function openSection(section: SectionId) {
@@ -333,9 +340,7 @@
         on<number>("audio-level", (e) => {
           if (typeof e.payload === "number") pushLevel(e.payload);
         }),
-        on<PipelineErrorPayload | string>("pipeline-error", (e) =>
-          showFlash(pipelineErrorText(e.payload), "err"),
-        ),
+        on<PipelineErrorPayload | string>("pipeline-error", (e) => showPipelineError(e.payload)),
         on("transcription-empty", () => showFlash(t("w.noSpeech"), "err")),
         on("transcription-cancelled", () => showFlash(t("w.cancelled"), "err")),
         on<UpdateNotice>("update-notice", (e) => showUpdateNotice(e.payload)),

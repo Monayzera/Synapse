@@ -105,9 +105,43 @@ export interface GroqModel {
   created: number;
 }
 
+export interface GroqLimit {
+  model: string;
+  kind: string;
+  limit: number;
+  at: number;
+}
+
 export interface GroqModels {
   models: GroqModel[];
   error: string | null;
+  limits?: GroqLimit[];
+}
+
+export type ErrorParams = Record<string, string | number>;
+
+export interface TestReport {
+  ok: boolean;
+  text: string;
+  ms: number;
+  model: string;
+  code: string | null;
+  params: ErrorParams;
+  detail: string;
+}
+
+export type LocalAiDevice = "gpu" | "cpu";
+
+export interface LocalAiStatus {
+  state: LlmState;
+  installed: boolean;
+  model_present: boolean;
+  variant: string | null;
+  device: LocalAiDevice | null;
+  device_name: string | null;
+  repairable: boolean;
+  setup_running: boolean;
+  last_error: string | null;
 }
 
 export interface StatusPayload {
@@ -138,12 +172,22 @@ export interface AutostartStatus {
 
 export type HwTier = "weak" | "modest" | "capable";
 
+export type GpuVendor = "nvidia" | "amd" | "intel" | "other";
+
+export interface GpuInfo {
+  vendor: GpuVendor;
+  name: string;
+  compute_cap: string | null;
+  driver_version: string | null;
+}
+
 export interface HardwareInfo {
   total_ram_mb: number;
   logical_cores: number;
   build_gpu: boolean;
   os: string;
   tier: HwTier;
+  gpu?: GpuInfo | null;
 }
 
 export interface HistoryEntry {
@@ -226,8 +270,12 @@ export interface DownloadProgress {
   error?: string | null;
 }
 
+export type PipelineErrorKind = "error" | "info";
+
 export interface PipelineErrorPayload {
   stage: string;
   code: string;
   message: string;
+  params?: ErrorParams;
+  kind?: PipelineErrorKind;
 }

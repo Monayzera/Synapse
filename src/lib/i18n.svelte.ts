@@ -141,6 +141,7 @@ const en = {
   "model.download": "Download",
   "model.starting": "Starting…",
   "model.failed": "Failed",
+  "model.off": "Off",
   "model.deleteLabel": "Delete model",
   "model.downloadFailed": "Download failed",
   "model.activateFailed": "Couldn't activate",
@@ -170,6 +171,23 @@ const en = {
   "ai.testOk": "Working",
   "ai.modelsFailed": "Couldn't update the model list",
   "ai.groqKeyInvalid": "Invalid Groq key",
+  "ai.groqNetworkBlocked": "Groq blocked your network (VPN/proxy?)",
+  "ai.testOkTime": "Working · {s} s",
+  "ai.status": "Status",
+  "ai.localReady": "Ready",
+  "ai.localReadyGpu": "Ready · GPU ({name})",
+  "ai.localReadyGpuPlain": "Ready · GPU",
+  "ai.localReadyCpu": "Ready · CPU",
+  "ai.localCpuRepair": "Running on CPU · Repair to use the GPU",
+  "ai.localStopped": "Stopped",
+  "ai.localOff": "Off",
+  "ai.restart": "Restart",
+  "ai.repair": "Repair",
+  "ai.repairTitle": "Reinstall the AI server to use the GPU",
+  "ai.groqLimitTpm": "This model has a low limit on Groq's free plan ({limit} tokens/min). When it's reached, Synapse uses another model.",
+  "ai.groqLimitRpm": "This model has a low limit on Groq's free plan ({limit} requests/min). When it's reached, Synapse uses another model.",
+  "ai.groqLimitTpd": "This model has a low daily quota on Groq's free plan ({limit} tokens/day). When it runs out, Synapse uses another model.",
+  "ai.groqLimitRpd": "This model has a low daily quota on Groq's free plan ({limit} requests/day). When it runs out, Synapse uses another model.",
 
   "stage.resolve_release": "Preparing…",
   "stage.download_binary": "Downloading server…",
@@ -196,7 +214,7 @@ const en = {
   "adv.performance": "Performance",
   "adv.gpu": "Use GPU",
   "adv.ai": "AI",
-  "adv.timeout": "Timeout",
+  "adv.timeout": "Minimum timeout",
   "adv.temperature": "Temperature",
   "adv.testConn": "Test connection",
   "adv.restartAi": "Restart local AI",
@@ -225,9 +243,31 @@ const en = {
   "err.engine_error": "Model error, retrying",
   "err.transcription_failed": "Transcription failed",
   "err.llm_not_ready": "AI starting, pasted as is",
-  "err.llm_not_configured": "Set up the AI to translate",
+  "err.llm_not_configured": "Set up the AI, pasted as is",
   "err.llm_failed": "AI failed, pasted as is",
   "err.llm_timeout": "AI timed out, pasted as is",
+  "err.llm_rate_limited": "AI limit reached, pasted without AI (retry in {seconds}s)",
+  "err.llm_quota": "AI quota used up, pasted without AI",
+  "err.llm_auth": "Invalid AI key, pasted without AI",
+  "err.llm_network_blocked": "Groq blocked your network (VPN/proxy?), pasted without AI",
+  "err.llm_network": "Can't reach the AI, pasted as is",
+  "err.llm_model_missing": "AI model unavailable, pasted as is",
+  "err.llm_cut_off": "AI reply cut off, pasted as is",
+  "err.llm_empty": "Empty AI reply, pasted as is",
+  "err.llm_local_stopped": "Local AI stopped, pasted as is",
+  "err.llm_too_long": "Text too long for the AI limit, pasted without AI",
+  "err.translation.llm_not_ready": "AI starting, pasted untranslated",
+  "err.translation.llm_not_configured": "Set up the AI to translate",
+  "err.translation.llm_failed": "AI failed, pasted untranslated",
+  "err.translation.llm_timeout": "AI timed out, pasted untranslated",
+  "err.translation.llm_network": "Can't reach the AI, pasted untranslated",
+  "err.translation.llm_model_missing": "AI model unavailable, pasted untranslated",
+  "err.translation.llm_cut_off": "AI reply cut off, pasted untranslated",
+  "err.translation.llm_empty": "Empty AI reply, pasted untranslated",
+  "err.translation.llm_local_stopped": "Local AI stopped, pasted untranslated",
+  "err.translation.llm_too_long": "Text too long for the AI limit, pasted untranslated",
+  "err.llm_fallback_model": "{from} limit reached, using {to}",
+  "err.translation_whisper_fallback": "AI unavailable, translated by Groq Whisper",
   "err.hotkey_failed": "Shortcut unavailable, retrying",
   "err.busy": "Still processing",
   "err.settings_unreadable": "Settings locked, using defaults",
@@ -238,6 +278,23 @@ const en = {
   "err.mic_prompt": "Answer the microphone prompt to start",
   "err.accessibility_stale": "Remove Synapse from Accessibility and add it again",
   "err.updating": "Installing an update, please wait",
+
+  "test.llm_rate_limited": "AI limit reached (retry in {seconds}s)",
+  "test.llm_quota": "AI quota used up",
+  "test.llm_auth": "Invalid AI key",
+  "test.llm_network_blocked": "Groq blocked your network (VPN/proxy?)",
+  "test.llm_network": "Can't reach the AI",
+  "test.llm_model_missing": "AI model unavailable",
+  "test.llm_cut_off": "AI reply cut off",
+  "test.llm_empty": "Empty AI reply",
+  "test.llm_failed": "The AI returned an error",
+  "test.llm_timeout": "The AI took too long",
+  "test.llm_not_ready": "Local AI still starting",
+  "test.llm_local_stopped": "Local AI stopped",
+  "test.llm_not_configured": "Set up the AI",
+  "test.llm_too_long": "Text too long for this model's limit",
+  "test.llm_disabled": "Turn on 'Correct text' or 'Translate to' to test the local AI",
+  "test.groq_llm_key_missing": "Add the Groq AI key",
 
   "w.starting": "Starting…",
   "w.noMic": "No microphone",
@@ -442,6 +499,7 @@ const pt: Record<TKey, string> = {
   "model.download": "Baixar",
   "model.starting": "Iniciando…",
   "model.failed": "Falhou",
+  "model.off": "Desligado",
   "model.deleteLabel": "Excluir modelo",
   "model.downloadFailed": "Falha no download",
   "model.activateFailed": "Não foi possível ativar",
@@ -471,6 +529,23 @@ const pt: Record<TKey, string> = {
   "ai.testOk": "Funcionando",
   "ai.modelsFailed": "Não foi possível atualizar a lista de modelos",
   "ai.groqKeyInvalid": "Chave da Groq inválida",
+  "ai.groqNetworkBlocked": "O Groq bloqueou sua rede (VPN/proxy?)",
+  "ai.testOkTime": "Funcionando · {s} s",
+  "ai.status": "Status",
+  "ai.localReady": "Pronta",
+  "ai.localReadyGpu": "Pronta · GPU ({name})",
+  "ai.localReadyGpuPlain": "Pronta · GPU",
+  "ai.localReadyCpu": "Pronta · CPU",
+  "ai.localCpuRepair": "Rodando na CPU · Reparar para usar a GPU",
+  "ai.localStopped": "Parou",
+  "ai.localOff": "Desligada",
+  "ai.restart": "Reiniciar",
+  "ai.repair": "Reparar",
+  "ai.repairTitle": "Reinstala o servidor da IA para usar a GPU",
+  "ai.groqLimitTpm": "Este modelo tem limite baixo no plano gratuito do Groq ({limit} tokens/min). Quando atingir, o Synapse usa outro modelo.",
+  "ai.groqLimitRpm": "Este modelo tem limite baixo no plano gratuito do Groq ({limit} pedidos/min). Quando atingir, o Synapse usa outro modelo.",
+  "ai.groqLimitTpd": "Este modelo tem cota diária baixa no plano gratuito do Groq ({limit} tokens/dia). Quando acabar, o Synapse usa outro modelo.",
+  "ai.groqLimitRpd": "Este modelo tem cota diária baixa no plano gratuito do Groq ({limit} pedidos/dia). Quando acabar, o Synapse usa outro modelo.",
 
   "stage.resolve_release": "Preparando…",
   "stage.download_binary": "Baixando servidor…",
@@ -497,7 +572,7 @@ const pt: Record<TKey, string> = {
   "adv.performance": "Desempenho",
   "adv.gpu": "Usar GPU",
   "adv.ai": "IA",
-  "adv.timeout": "Tempo limite",
+  "adv.timeout": "Tempo limite mínimo",
   "adv.temperature": "Temperatura",
   "adv.testConn": "Testar conexão",
   "adv.restartAi": "Reiniciar IA local",
@@ -526,9 +601,31 @@ const pt: Record<TKey, string> = {
   "err.engine_error": "Erro no modelo, tentando de novo",
   "err.transcription_failed": "Falha na transcrição",
   "err.llm_not_ready": "IA iniciando, colado sem correção",
-  "err.llm_not_configured": "Configure a IA para traduzir",
+  "err.llm_not_configured": "Configure a IA, colado sem correção",
   "err.llm_failed": "Falha na IA, colado sem correção",
   "err.llm_timeout": "IA demorou, colado sem correção",
+  "err.llm_rate_limited": "Limite da IA atingido, colado sem IA (tente em {seconds}s)",
+  "err.llm_quota": "Cota da IA esgotada, colado sem IA",
+  "err.llm_auth": "Chave da IA inválida, colado sem IA",
+  "err.llm_network_blocked": "O Groq bloqueou sua rede (VPN/proxy?), colado sem IA",
+  "err.llm_network": "Sem conexão com a IA, colado sem correção",
+  "err.llm_model_missing": "Modelo da IA indisponível, colado sem correção",
+  "err.llm_cut_off": "Resposta da IA cortada, colado sem correção",
+  "err.llm_empty": "Resposta vazia da IA, colado sem correção",
+  "err.llm_local_stopped": "IA local parou, colado sem correção",
+  "err.llm_too_long": "Texto longo demais para o limite da IA, colado sem IA",
+  "err.translation.llm_not_ready": "IA iniciando, colado sem tradução",
+  "err.translation.llm_not_configured": "Configure a IA para traduzir",
+  "err.translation.llm_failed": "Falha na IA, colado sem tradução",
+  "err.translation.llm_timeout": "IA demorou, colado sem tradução",
+  "err.translation.llm_network": "Sem conexão com a IA, colado sem tradução",
+  "err.translation.llm_model_missing": "Modelo da IA indisponível, colado sem tradução",
+  "err.translation.llm_cut_off": "Resposta da IA cortada, colado sem tradução",
+  "err.translation.llm_empty": "Resposta vazia da IA, colado sem tradução",
+  "err.translation.llm_local_stopped": "IA local parou, colado sem tradução",
+  "err.translation.llm_too_long": "Texto longo demais para o limite da IA, colado sem tradução",
+  "err.llm_fallback_model": "Limite do {from} atingido, usando o {to}",
+  "err.translation_whisper_fallback": "IA indisponível, traduzido pelo Whisper do Groq",
   "err.hotkey_failed": "Atalho indisponível, tentando de novo",
   "err.busy": "Ainda processando",
   "err.settings_unreadable": "Ajustes bloqueados, usando o padrão",
@@ -539,6 +636,23 @@ const pt: Record<TKey, string> = {
   "err.mic_prompt": "Responda ao pedido do microfone para começar",
   "err.accessibility_stale": "Remova o Synapse da Acessibilidade e adicione de novo",
   "err.updating": "Instalando atualização, aguarde",
+
+  "test.llm_rate_limited": "Limite da IA atingido (tente em {seconds}s)",
+  "test.llm_quota": "Cota da IA esgotada",
+  "test.llm_auth": "Chave da IA inválida",
+  "test.llm_network_blocked": "O Groq bloqueou sua rede (VPN/proxy?)",
+  "test.llm_network": "Sem conexão com a IA",
+  "test.llm_model_missing": "Modelo da IA indisponível",
+  "test.llm_cut_off": "Resposta da IA cortada",
+  "test.llm_empty": "Resposta vazia da IA",
+  "test.llm_failed": "A IA retornou um erro",
+  "test.llm_timeout": "A IA demorou demais",
+  "test.llm_not_ready": "IA local ainda iniciando",
+  "test.llm_local_stopped": "IA local parou",
+  "test.llm_not_configured": "Configure a IA",
+  "test.llm_too_long": "Texto longo demais para o limite deste modelo",
+  "test.llm_disabled": "Ative 'Corrigir texto' ou 'Traduzir para' para testar a IA local",
+  "test.groq_llm_key_missing": "Adicione a chave do Groq (IA)",
 
   "w.starting": "Iniciando…",
   "w.noMic": "Sem microfone",
@@ -672,4 +786,38 @@ export function tOr(key: string, fallback: string, params?: Params): string {
   const active = current.lang;
   const hit = own(DICTS[active], key) ?? own(DICTS.en, key);
   return hit !== undefined ? format(hit, params) : fallback;
+}
+
+function cleanParams(raw: unknown): Params {
+  const out: Params = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value === "string") out[name] = value;
+    else if (typeof value === "number" && Number.isFinite(value)) {
+      out[name] = Math.ceil(value).toLocaleString(locale());
+    }
+  }
+  return out;
+}
+
+function fillFirst(keys: string[], params: unknown, fallback: string): string {
+  const clean = cleanParams(params);
+  for (const key of keys) {
+    const text = tOr(key, "", clean);
+    if (!text) continue;
+    const filled = text.replace(/\s*\([^()]*\{\w+\}[^()]*\)/g, "").trim();
+    return filled && !/\{\w+\}/.test(filled) ? filled : fallback;
+  }
+  return fallback;
+}
+
+export function tCode(code: string, params: unknown, fallback: string, stage?: string): string {
+  if (!code) return fallback;
+  const keys = stage === "translation" ? [`err.translation.${code}`, `err.${code}`] : [`err.${code}`];
+  return fillFirst(keys, params, fallback);
+}
+
+export function tTest(code: string, params: unknown, fallback: string): string {
+  if (!code) return fallback;
+  return fillFirst([`test.${code}`, `err.${code}`], params, fallback);
 }

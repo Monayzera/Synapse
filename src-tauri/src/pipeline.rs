@@ -1,8 +1,10 @@
+use crate::cleanup::{FailureKind, LlmContext, Notice};
 use crate::config::{LlmBackend, Settings, TranscriptionBackend};
 use crate::error::{AppError, AppResult};
 use crate::state::{AppState, LlmState, SharedState, Status};
 use crate::{dictionary, history, inject};
 use serde::Serialize;
+use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
@@ -28,14 +30,36 @@ struct PipelineError {
     stage: String,
     code: String,
     message: String,
+    params: Value,
+    kind: &'static str,
+}
+
+struct Issue {
+    code: &'static str,
+    message: String,
+    params: Value,
 }
 
 pub fn emit_error(app: &AppHandle, stage: &str, code: &str, message: &str) {
-    tracing::info!("pipeline-error [{stage}/{code}]: {message}");
+    emit_event(app, stage, code, message, json!({}), "error");
+}
+
+fn emit_issue(app: &AppHandle, stage: &str, issue: Issue) {
+    emit_event(app, stage, issue.code, &issue.message, issue.params, "error");
+}
+
+fn emit_notice(app: &AppHandle, stage: &str, notice: Notice) {
+    emit_event(app, stage, notice.code, &notice.message, notice.params, "info");
+}
+
+fn emit_event(app: &AppHandle, stage: &str, code: &str, message: &str, params: Value, kind: &'static str) {
+    tracing::info!("pipeline-error [{stage}/{code}] {kind}: {message}");
     let payload = PipelineError {
         stage: stage.to_string(),
         code: code.to_string(),
         message: message.to_string(),
+        params,
+        kind,
     };
     if let Err(err) = app.emit("pipeline-error", payload) {
         tracing::warn!("pipeline-error emit failed: {err}");
@@ -217,7 +241,7 @@ async fn run_pipeline(
     let settings = state.settings_snapshot();
     let duration_ms = captured.duration_ms;
     let language = settings.language_code();
-    let whisper_translated = settings.whisper_translate();
+    let wants_translation = settings.translation_enabled;
 
     let backend = settings.transcription_backend;
 
@@ -259,6 +283,12 @@ async fn run_pipeline(
         }
     };
 
+    let reserve_samples = if reserve_possible(&settings) {
+        Some(trimmed.clone())
+    } else {
+        None
+    };
+
     let (raw, on_gpu) = match backend {
         TranscriptionBackend::Groq => {
             let key = settings.groq_api_key.trim().to_string();
@@ -277,7 +307,7 @@ async fn run_pipeline(
                 &samples,
                 lang.as_deref(),
                 prompt.as_deref(),
-                whisper_translated,
+                false,
                 &settings.groq_model,
             );
             tokio::pin!(call);
@@ -306,7 +336,6 @@ async fn run_pipeline(
                 let result = blocking_state.transcribe_blocking(
                     &trimmed,
                     lang_for_blocking.as_deref(),
-                    whisper_translated,
                 );
                 tracing::info!("whisper took {} ms", whisper_start.elapsed().as_millis());
                 result
@@ -349,48 +378,55 @@ async fn run_pipeline(
         &settings.dictionary,
     );
 
-    let wants_translation = settings.translation_enabled && !whisper_translated;
     let want_llm = settings.llm_enabled || wants_translation;
+    let stage = if wants_translation { "translation" } else { "ai" };
     let gate = if want_llm {
         llm_gate(state, &settings, wants_translation).await
     } else {
         LlmGate::Skip(None)
     };
-    let (final_text, llm_used, llm_issue) = match gate {
+    let (mut final_text, llm_used, mut llm_issue, mut notices) = match gate {
         LlmGate::Cancelled => {
             let _ = app.emit("transcription-cancelled", ());
             return Ok(());
         }
-        LlmGate::Skip(issue) => (processed.clone(), false, issue),
+        LlmGate::Skip(issue) => (
+            processed.clone(),
+            false,
+            issue.map(|(code, message)| Issue {
+                code,
+                message,
+                params: json!({}),
+            }),
+            Vec::new(),
+        ),
         LlmGate::Run => {
-            let eff: std::borrow::Cow<'_, Settings> = if whisper_translated {
-                let mut tuned = settings.clone();
-                tuned.translation_enabled = false;
-                std::borrow::Cow::Owned(tuned)
-            } else {
-                std::borrow::Cow::Borrowed(&settings)
+            let ctx = LlmContext {
+                local_gpu: state.local_ai_gpu(),
             };
             let llm_start = std::time::Instant::now();
-            let Some(mut outcome) = cancellable(state.llm.cleanup(&eff, &processed)).await else {
+            let Some(mut outcome) = cancellable(state.llm.cleanup(&settings, &processed, &ctx)).await
+            else {
                 let _ = app.emit("transcription-cancelled", ());
                 return Ok(());
             };
-            let model_missing = matches!(eff.llm_backend, LlmBackend::Groq)
+            let model_missing = matches!(settings.llm_backend, LlmBackend::Groq)
                 && outcome
                     .error
-                    .as_deref()
-                    .is_some_and(crate::groq::is_model_missing);
+                    .as_ref()
+                    .is_some_and(|err| err.kind == FailureKind::ModelMissing);
             if model_missing {
-                let failed = eff.groq_llm_model.clone();
+                let failed = settings.groq_llm_model.clone();
                 let Some(next) = cancellable(crate::groq::recover_model(state, &failed)).await
                 else {
                     let _ = app.emit("transcription-cancelled", ());
                     return Ok(());
                 };
                 if let Some(model) = next {
-                    let mut retry: Settings = (*eff).clone();
+                    let mut retry: Settings = settings.clone();
                     retry.groq_llm_model = model;
-                    let Some(again) = cancellable(state.llm.cleanup(&retry, &processed)).await
+                    let Some(again) =
+                        cancellable(state.llm.cleanup(&retry, &processed, &ctx)).await
                     else {
                         let _ = app.emit("transcription-cancelled", ());
                         return Ok(());
@@ -398,17 +434,65 @@ async fn run_pipeline(
                     outcome = again;
                 }
             }
+            crate::groq::persist_learned(state);
             tracing::info!("llm cleanup took {} ms", llm_start.elapsed().as_millis());
-            let issue = outcome.error.map(|message| {
-                if outcome.timed_out {
-                    ("llm_timeout", message)
-                } else {
-                    ("llm_failed", message)
-                }
+            let issue = outcome.error.map(|err| Issue {
+                code: err.code(),
+                params: err.params(),
+                message: err.message,
             });
-            (outcome.text, outcome.applied, issue)
+            (outcome.text, outcome.applied, issue, outcome.notices)
         }
     };
+
+    if use_whisper_reserve(&settings, llm_used, llm_issue.is_some()) {
+        if let Some(samples) = reserve_samples.as_deref() {
+            let reason = llm_issue.as_ref().map_or("llm_failed", |issue| issue.code);
+            let key = settings.groq_api_key.trim().to_string();
+            let reserve_start = std::time::Instant::now();
+            let call = crate::groq::transcribe(
+                state.llm.http(),
+                &key,
+                samples,
+                None,
+                None,
+                true,
+                crate::groq::TRANSLATE_MODEL,
+            );
+            let Some(result) = cancellable(call).await else {
+                let _ = app.emit("transcription-cancelled", ());
+                return Ok(());
+            };
+            match result {
+                Ok(text) => {
+                    let translated = dictionary::process(
+                        &text,
+                        settings.filler_removal,
+                        &settings.filler_words,
+                        &settings.dictionary,
+                    );
+                    if translated.trim().is_empty() {
+                        tracing::warn!("whisper English translation returned no text; pasting untranslated");
+                    } else {
+                        tracing::info!(
+                            "AI translation unavailable ({reason}); whisper translated to English in {} ms",
+                            reserve_start.elapsed().as_millis()
+                        );
+                        final_text = translated;
+                        llm_issue = None;
+                        notices.push(Notice {
+                            code: "translation_whisper_fallback",
+                            message: "The AI translation was unavailable; Whisper translated the text to English.".to_string(),
+                            params: json!({ "reason_code": reason }),
+                        });
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("whisper English translation failed ({err}); pasting untranslated")
+                }
+            }
+        }
+    }
 
     if CANCEL.load(Ordering::Acquire) {
         let _ = app.emit("transcription-cancelled", ());
@@ -472,12 +556,22 @@ async fn run_pipeline(
         },
     );
 
-    if let Some((code, message)) = llm_issue {
-        let stage = if wants_translation { "translation" } else { "ai" };
-        emit_error(app, stage, code, &message);
+    for notice in notices {
+        emit_notice(app, stage, notice);
+    }
+    if let Some(issue) = llm_issue {
+        emit_issue(app, stage, issue);
     }
 
     Ok(())
+}
+
+fn reserve_possible(settings: &Settings) -> bool {
+    settings.translation_to_english() && !settings.groq_api_key.trim().is_empty()
+}
+
+fn use_whisper_reserve(settings: &Settings, llm_used: bool, llm_failed: bool) -> bool {
+    reserve_possible(settings) && !llm_used && llm_failed
 }
 
 async fn cancellable<F: std::future::Future>(future: F) -> Option<F::Output> {
@@ -502,14 +596,12 @@ enum LlmGate {
 
 async fn llm_gate(state: &SharedState, settings: &Settings, wants_translation: bool) -> LlmGate {
     let not_configured = || {
-        if wants_translation {
-            LlmGate::Skip(Some((
-                "llm_not_configured",
-                "Translation needs an AI provider; the text was pasted untranslated.".to_string(),
-            )))
+        let message = if wants_translation {
+            "Translation needs an AI provider; the text was pasted untranslated."
         } else {
-            LlmGate::Skip(None)
-        }
+            "AI correction needs an AI provider; the text was pasted without AI."
+        };
+        LlmGate::Skip(Some(("llm_not_configured", message.to_string())))
     };
     match settings.llm_backend {
         LlmBackend::Groq => {
@@ -530,7 +622,7 @@ async fn llm_gate(state: &SharedState, settings: &Settings, wants_translation: b
                     LlmState::Off => return not_configured(),
                     LlmState::Failed => {
                         return LlmGate::Skip(Some((
-                            "llm_failed",
+                            "llm_local_stopped",
                             "The local AI server is not running; the text was pasted without AI."
                                 .to_string(),
                         )))
@@ -605,4 +697,37 @@ fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn translating(enabled: bool, target: &str, voice_key: &str) -> Settings {
+        Settings {
+            translation_enabled: enabled,
+            translation_target: target.to_string(),
+            groq_api_key: voice_key.to_string(),
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn whisper_reserve_needs_english_target_and_voice_key() {
+        assert!(reserve_possible(&translating(true, "English", "gsk_voice")));
+        assert!(reserve_possible(&translating(true, "  english ", "gsk_voice")));
+        assert!(!reserve_possible(&translating(false, "English", "gsk_voice")));
+        assert!(!reserve_possible(&translating(true, "German", "gsk_voice")));
+        assert!(!reserve_possible(&translating(true, "English", "   ")));
+    }
+
+    #[test]
+    fn whisper_reserve_runs_only_after_the_llm_did_not_apply() {
+        let english = translating(true, "English", "gsk_voice");
+        assert!(use_whisper_reserve(&english, false, true));
+        assert!(!use_whisper_reserve(&english, true, false));
+        assert!(!use_whisper_reserve(&english, false, false));
+        assert!(!use_whisper_reserve(&translating(true, "Spanish", "gsk_voice"), false, true));
+        assert!(!use_whisper_reserve(&translating(true, "English", ""), false, true));
+    }
 }

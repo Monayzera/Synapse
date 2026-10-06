@@ -12,11 +12,11 @@
     label: string;
     busyLabel: string;
     okLabel: string;
-    action: () => Promise<{ ok: boolean; detail: string }>;
+    action: () => Promise<{ ok: boolean; detail: string; title?: string }>;
   } = $props();
 
   let busy = $state(false);
-  let result = $state<{ ok: boolean; detail: string } | null>(null);
+  let result = $state<{ ok: boolean; detail: string; title?: string } | null>(null);
 
   async function run() {
     if (busy) return;
@@ -40,7 +40,7 @@
     {#if result.ok}
       <span class="ok-line"><Icon name="check-circle" size={14} />{okLabel}</span>
     {:else}
-      <span class="err-line one-line" title={result.detail}>
+      <span class="err-line one-line" title={result.title || result.detail}>
         {t("common.failed")}{result.detail ? ": " + result.detail : ""}
       </span>
     {/if}

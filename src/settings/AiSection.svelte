@@ -2,7 +2,8 @@
   import { onMount } from "svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import Icon from "../lib/Icon.svelte";
-  import { t, tOr, type TKey } from "../lib/i18n.svelte";
+  import { api } from "../lib/ipc";
+  import { t, tOr, locale, type TKey } from "../lib/i18n.svelte";
   import type { LlmBackend, Settings } from "../lib/types";
   import Switch from "./Switch.svelte";
   import Segmented from "./Segmented.svelte";
@@ -15,9 +16,12 @@
     startLlamaSetup,
     fmtBytes,
     testLlm,
+    testOkLabel,
     refreshModels,
     refreshLlama,
+    refreshLocalAi,
     refreshGroqModels,
+    repairLocalAi,
   } from "./store.svelte";
 
   let { s }: { s: Settings } = $props();
@@ -25,6 +29,7 @@
   onMount(() => {
     refreshModels();
     refreshLlama();
+    refreshLocalAi();
     refreshGroqModels();
   });
 
@@ -49,6 +54,18 @@
 
   const RECOMMENDED_LLM = "gemma-3-4b-it";
 
+  const LIMIT_KEYS: Record<string, TKey> = {
+    otpm: "ai.groqLimitTpm",
+    tpm: "ai.groqLimitTpm",
+    itpm: "ai.groqLimitTpm",
+    rpm: "ai.groqLimitRpm",
+    tpd: "ai.groqLimitTpd",
+    rpd: "ai.groqLimitRpd",
+  };
+
+  let test = $state<{ provider: string; ms: number; text: string } | null>(null);
+  let restarting = $state(false);
+
   const provider = $derived(
     s.llm_backend === "local" ? "local" : s.llm_backend === "groq" ? "groq" : "other",
   );
@@ -60,8 +77,87 @@
   const groqError = $derived.by(() => {
     const code = app.groq?.error;
     if (!code || code === "key_missing" || !s.groq_llm_api_key.trim()) return "";
-    return code === "invalid_key" ? t("ai.groqKeyInvalid") : t("ai.modelsFailed");
+    if (code === "invalid_key") return t("ai.groqKeyInvalid");
+    if (code === "network_blocked") return t("ai.groqNetworkBlocked");
+    return t("ai.modelsFailed");
   });
+  const groqLimitNote = $derived.by(() => {
+    if (!s.groq_llm_api_key.trim()) return "";
+    const list = app.groq?.limits;
+    if (!Array.isArray(list)) return "";
+    let key: TKey | null = null;
+    let limit = 0;
+    let newest = -Infinity;
+    for (const entry of list) {
+      if (!entry || typeof entry !== "object" || entry.model !== s.groq_llm_model) continue;
+      const kind = typeof entry.kind === "string" ? entry.kind.toLowerCase() : "";
+      if (!Object.prototype.hasOwnProperty.call(LIMIT_KEYS, kind)) continue;
+      if (typeof entry.limit !== "number" || !Number.isFinite(entry.limit) || entry.limit <= 0) continue;
+      const at = typeof entry.at === "number" && Number.isFinite(entry.at) ? entry.at : 0;
+      if (at < newest) continue;
+      newest = at;
+      key = LIMIT_KEYS[kind];
+      limit = entry.limit;
+    }
+    return key ? t(key, { limit: Math.round(limit).toLocaleString(locale()) }) : "";
+  });
+  const setupBusy = $derived(app.llamaRunning || !!app.localAi?.setup_running);
+  const localState = $derived(app.localAi?.state ?? app.status?.llm ?? null);
+  const canRepair = $derived(
+    !setupBusy &&
+      !!app.localAi?.repairable &&
+      (localState === "failed" || (localState === "ready" && app.localAi?.device !== "gpu")),
+  );
+  const installError = $derived(
+    !setupBusy && progress?.error ? app.localAi?.last_error || progress.error : "",
+  );
+  let keepInstalled = $state(false);
+  $effect(() => {
+    if (!setupBusy) keepInstalled = false;
+    else if (llamaReady) keepInstalled = true;
+  });
+  const localInstalled = $derived(llamaReady || (setupBusy && keepInstalled));
+  const localLine = $derived.by(() => {
+    const ai = app.localAi;
+    if (localState === "ready") {
+      if (ai?.device === "gpu") {
+        return ai.device_name
+          ? t("ai.localReadyGpu", { name: ai.device_name })
+          : t("ai.localReadyGpuPlain");
+      }
+      if (ai?.repairable) return t("ai.localCpuRepair");
+      if (ai?.device === "cpu") return t("ai.localReadyCpu");
+      return t("ai.localReady");
+    }
+    if (localState === "starting") return t("model.starting");
+    if (localState === "off" && !s.llm_enabled && !s.translation_enabled) return t("ai.localOff");
+    return "";
+  });
+  const showLocalStatus = $derived(
+    setupBusy || localState === "failed" || !!localLine || !!installError,
+  );
+  const testOk = $derived(testOkLabel(test && test.provider === provider ? test.ms : 0));
+
+  async function runTest(): Promise<{ ok: boolean; detail: string; title?: string }> {
+    const which = provider;
+    test = null;
+    const result = await testLlm();
+    if (result.ok) test = { provider: which, ms: result.report?.ms ?? 0, text: result.detail.trim() };
+    return result;
+  }
+
+  function restartLocal() {
+    if (restarting) return;
+    restarting = true;
+    void api
+      .restartLlm()
+      .catch(() => {})
+      .finally(() => {
+        restarting = false;
+        refreshLocalAi();
+        refreshLlama();
+      });
+  }
 
   function shortId(id: string): string {
     const tail = id.split("/").pop()?.trim();
@@ -75,6 +171,7 @@
   }
 
   function pickProvider(id: string) {
+    if (id !== provider) test = null;
     if (id === "local") void commit({ llm_backend: "local" });
     else if (id === "groq") void commit({ llm_backend: "groq" });
     else if (provider !== "other") void commit({ llm_backend: "open_ai_compatible" });
@@ -89,6 +186,22 @@
     openUrl("https://console.groq.com/keys").catch(() => {});
   }
 </script>
+
+{#snippet testRow()}
+  <div class="item">
+    <div class="item-text">
+      <ActionButton
+        label={t("ai.test")}
+        busyLabel={t("ai.testing")}
+        okLabel={testOk}
+        action={runTest}
+      />
+      {#if test && test.provider === provider && test.text}
+        <span class="item-sub" title={test.text}>{test.text}</span>
+      {/if}
+    </div>
+  </div>
+{/snippet}
 
 <div class="group">
   <Switch
@@ -139,10 +252,15 @@
       link={{ label: t("voice.getKey"), onclick: openGroqKeys }}
     />
     <div class="item">
-      {#if groqError}
-        <div class="item-text">
+      {#if groqError || groqLimitNote}
+        <div class="item-text fill">
           <label class="item-label" for="ai-groq-model">{t("ai.model")}</label>
-          <span class="item-sub err" title={groqError}>{groqError}</span>
+          {#if groqError}
+            <span class="item-sub err" title={groqError}>{groqError}</span>
+          {/if}
+          {#if groqLimitNote}
+            <span class="field-hint">{groqLimitNote}</span>
+          {/if}
         </div>
       {:else}
         <label class="item-label" for="ai-groq-model">{t("ai.model")}</label>
@@ -160,6 +278,7 @@
         {/if}
       </select>
     </div>
+    {@render testRow()}
   {:else if provider === "other"}
     <div class="item">
       <label class="item-label" for="ai-type">{t("ai.type")}</label>
@@ -180,19 +299,53 @@
     <TextField key="llm_endpoint" label={t("ai.endpoint")} placeholder="https://" />
     <TextField key="llm_model_name" label={t("ai.modelName")} />
     <TextField key="llm_api_key" label={t("ai.key")} secret />
-    <div class="item">
-      <ActionButton
-        label={t("ai.test")}
-        busyLabel={t("ai.testing")}
-        okLabel={t("ai.testOk")}
-        action={testLlm}
-      />
-    </div>
+    {@render testRow()}
+  {:else if provider === "local" && localInstalled}
+    {#if showLocalStatus}
+      <div class="model-row">
+        <div class="model-main">
+          <span class="item-label">{t("ai.status")}</span>
+          {#if setupBusy}
+            <div class="bar">
+              <span style={`width:${Math.max(0, Math.min(100, progress?.overall_pct ?? 0))}%`}></span>
+            </div>
+            <div class="model-meta tnum">
+              {progress ? tOr(`stage.${progress.stage}`, t("common.loading")) : t("common.loading")}
+              {#if progress}· {Math.round(progress.overall_pct || 0)}%{/if}
+            </div>
+          {:else}
+            {#if localState === "failed"}
+              <div class="err-line" title={app.localAi?.last_error ?? undefined}>{t("ai.localStopped")}</div>
+            {:else if localLine}
+              <div class="model-meta">{localLine}</div>
+            {/if}
+            {#if installError}
+              <div class="err-line" title={installError}>{t("ai.installFailed")}</div>
+            {/if}
+          {/if}
+        </div>
+        {#if !setupBusy && (localState === "failed" || canRepair)}
+          <div class="model-actions">
+            {#if localState === "failed"}
+              <button type="button" class="btn sm" onclick={restartLocal} disabled={restarting}>
+                {restarting ? t("adv.restarting") : t("ai.restart")}
+              </button>
+            {/if}
+            {#if canRepair}
+              <button type="button" class="btn sm" title={t("ai.repairTitle")} onclick={repairLocalAi}>
+                {t("ai.repair")}
+              </button>
+            {/if}
+          </div>
+        {/if}
+      </div>
+    {/if}
+    {@render testRow()}
   {/if}
 </div>
 
 {#if provider === "local" && app.llama}
-  {#if llamaReady}
+  {#if localInstalled}
     <ModelList kind="llm" recommended={RECOMMENDED_LLM} />
   {:else}
     <div class="group">
@@ -205,7 +358,7 @@
           {#if recommended && fmtBytes(recommended.info.size_bytes)}
             <div class="model-meta tnum">{fmtBytes(recommended.info.size_bytes)}</div>
           {/if}
-          {#if app.llamaRunning}
+          {#if setupBusy}
             <div class="bar">
               <span style={`width:${Math.max(0, Math.min(100, progress?.overall_pct ?? 0))}%`}></span>
             </div>
@@ -222,13 +375,19 @@
             type="button"
             class="btn primary sm"
             onclick={startLlamaSetup}
-            disabled={app.llamaRunning}
+            disabled={setupBusy}
           >
             <Icon name="download-simple" size={14} />
-            {progress?.error && !app.llamaRunning ? t("common.retry") : t("ai.install")}
+            {progress?.error && !setupBusy ? t("common.retry") : t("ai.install")}
           </button>
         </div>
       </div>
     </div>
   {/if}
 {/if}
+
+<style>
+  .fill {
+    flex: 1 1 0;
+  }
+</style>
