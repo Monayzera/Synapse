@@ -1,9 +1,13 @@
 use crate::error::{AppError, AppResult};
 use crate::hardware::GpuMark;
 use crate::pipeline::CANCEL;
-use std::path::Path;
-use std::sync::atomic::Ordering;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+
+static CRASH_PATHS: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
+static ARMED: AtomicU32 = AtomicU32::new(0);
 
 pub struct TranscribeEngine {
     context: WhisperContext,
@@ -12,7 +16,31 @@ pub struct TranscribeEngine {
     pub gpu_check: parking_lot::Mutex<Option<GpuMark>>,
 }
 
+pub fn set_crash_paths(pending: PathBuf, crashed: PathBuf) {
+    if CRASH_PATHS.set((pending, crashed)).is_err() {
+        tracing::warn!("whisper crash record paths were already set");
+    }
+}
+
+pub fn mirror_armed(count: u32) {
+    ARMED.store(count, Ordering::Release);
+}
+
+fn record_crash() -> bool {
+    if ARMED.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    match CRASH_PATHS.get() {
+        Some((pending, crashed)) => std::fs::rename(pending, crashed).is_ok(),
+        None => false,
+    }
+}
+
 extern "C" fn log_ggml_abort(message: *const std::os::raw::c_char) {
+    let recorded = record_crash();
+    if recorded {
+        tracing::error!("whisper graphics card crash recorded");
+    }
     let text = if message.is_null() {
         "no reason given".to_string()
     } else {
@@ -253,4 +281,31 @@ fn lower_first_alpha(segment: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crash_is_recorded_only_while_armed() {
+        let dir = std::env::temp_dir().join(format!("synapse-whisper-crash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(std::fs::create_dir_all(&dir).is_ok());
+        let pending = dir.join(crate::hardware::WHISPER_GPU_PENDING);
+        let crashed = dir.join(crate::hardware::WHISPER_GPU_CRASHED);
+        set_crash_paths(pending.clone(), crashed.clone());
+        assert!(std::fs::write(&pending, b"{}").is_ok());
+        mirror_armed(0);
+        assert!(!record_crash());
+        assert!(pending.exists());
+        assert!(!crashed.exists());
+        mirror_armed(1);
+        assert!(record_crash());
+        assert!(!pending.exists());
+        assert!(crashed.exists());
+        assert!(!record_crash());
+        mirror_armed(0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

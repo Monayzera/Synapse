@@ -181,6 +181,8 @@ export interface GpuInfo {
   driver_version: string | null;
 }
 
+export type WhisperGpu = "allowed" | "not_compiled" | "no_nvidia" | "unsupported" | "blocked";
+
 export interface HardwareInfo {
   total_ram_mb: number;
   logical_cores: number;
@@ -188,6 +190,7 @@ export interface HardwareInfo {
   os: string;
   tier: HwTier;
   gpu?: GpuInfo | null;
+  whisper_gpu?: WhisperGpu;
 }
 
 export interface HistoryEntry {

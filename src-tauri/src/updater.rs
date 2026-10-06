@@ -1358,6 +1358,7 @@ impl AutoUpdater {
     fn before_exit(&self) {
         self.hook_ran.store(true, Ordering::Release);
         if let Some(state) = self.app.try_state::<SharedState>() {
+            state.clear_whisper_pending();
             crate::widget_pos::flush(&state);
             state.stop_sidecar();
         }

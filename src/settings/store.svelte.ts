@@ -448,9 +448,10 @@ export async function testLlm(): Promise<{
 
 const SETUP_BUSY = "Setup already in progress.";
 
-function setupRejected(e: unknown) {
+function setupRejected(e: unknown, previous: LlamaSetupProgress | null) {
   const detail = describeError(e);
   if (detail.trim() === SETUP_BUSY) {
+    if (app.llamaProgress === null) app.llamaProgress = previous;
     refreshLocalAi();
     return;
   }
@@ -467,15 +468,17 @@ function setupRejected(e: unknown) {
 }
 
 export function repairLocalAi() {
+  const previous = app.llamaProgress;
   app.llamaRunning = true;
   app.llamaProgress = null;
-  api.repairLocalAi().catch(setupRejected);
+  api.repairLocalAi().catch((e) => setupRejected(e, previous));
 }
 
 export function startLlamaSetup() {
+  const previous = app.llamaProgress;
   app.llamaRunning = true;
   app.llamaProgress = null;
-  api.setupLlamaAuto().catch(setupRejected);
+  api.setupLlamaAuto().catch((e) => setupRejected(e, previous));
 }
 
 export function markDownloadStart(id: string) {

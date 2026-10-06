@@ -312,21 +312,29 @@ pub fn launch(app: AppHandle, state: SharedState, mode: SetupMode) -> Result<(),
 }
 
 async fn settle(state: &SharedState, outcome: SidecarOutcome) -> SidecarOutcome {
-    if outcome != SidecarOutcome::Superseded {
+    if !matches!(outcome, SidecarOutcome::Superseded | SidecarOutcome::Failed) {
         return outcome;
     }
     let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
     loop {
-        match state.local_llm_state() {
-            LlmState::Ready => return SidecarOutcome::Ready,
-            LlmState::Off => return SidecarOutcome::Off,
-            LlmState::Failed => return SidecarOutcome::Failed,
-            LlmState::Starting => {}
+        if let Some(done) = settled(state.local_llm_state()) {
+            return done;
+        }
+        if services::retries_exhausted(state) {
+            return SidecarOutcome::Failed;
         }
         if tokio::time::Instant::now() >= deadline {
             return SidecarOutcome::Failed;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+fn settled(state: LlmState) -> Option<SidecarOutcome> {
+    match state {
+        LlmState::Ready => Some(SidecarOutcome::Ready),
+        LlmState::Off => Some(SidecarOutcome::Off),
+        LlmState::Failed | LlmState::Starting => None,
     }
 }
 
@@ -561,7 +569,7 @@ async fn stage_package(
     );
     match extract_staged(archives.clone(), stage_dir.to_path_buf()).await {
         Ok(root) => Ok(root),
-        Err(err) if reused => {
+        Err(err) if reused && archive_error(&err) => {
             tracing::warn!("cached llama-server package unusable ({err}); downloading it again");
             discard(&archives).await;
             let (fresh, _) = fetch_package(meter, client, package, downloads, span)
@@ -570,13 +578,17 @@ async fn stage_package(
             match extract_staged(fresh.clone(), stage_dir.to_path_buf()).await {
                 Ok(root) => Ok(root),
                 Err(err) => {
-                    discard(&fresh).await;
+                    if archive_error(&err) {
+                        discard(&fresh).await;
+                    }
                     Err((Stage::Unzip, err))
                 }
             }
         }
         Err(err) => {
-            discard(&archives).await;
+            if archive_error(&err) {
+                discard(&archives).await;
+            }
             Err((Stage::Unzip, err))
         }
     }
@@ -701,16 +713,9 @@ where
 }
 
 fn extract_package(archives: &[PathBuf], stage: &Path) -> AppResult<PathBuf> {
-    match std::fs::remove_dir_all(stage) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(AppError::Io(format!(
-                "could not clear {}: {err}",
-                stage.display()
-            )))
-        }
-    }
+    clear_dir_retry(stage, SWAP_BUDGET).map_err(|err| {
+        AppError::Io(format!("could not clear {}: {err}", stage.display()))
+    })?;
     std::fs::create_dir_all(stage)?;
     for archive in archives {
         let lower = archive
@@ -766,6 +771,7 @@ fn list_devices(dir: &Path) -> Result<Vec<BackendDevice>, String> {
         path.push(current);
     }
     command.env("PATH", path);
+    command.env_remove("CUDA_VISIBLE_DEVICES");
     let text = crate::sidecar::run_capture(command, LIST_DEVICES_TIMEOUT)?;
     if !text.contains("Available devices") {
         let snippet: String = text.trim().chars().take(240).collect();
@@ -935,6 +941,34 @@ fn is_sharing_violation(err: &std::io::Error) -> bool {
     cfg!(windows) && matches!(err.raw_os_error(), Some(32) | Some(5))
 }
 
+fn clear_dir_retry(dir: &Path, budget: Duration) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + budget;
+    let mut delay = Duration::from_millis(100);
+    loop {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err)
+                if is_sharing_violation(&err)
+                    && std::time::Instant::now() + delay <= deadline =>
+            {
+                tracing::info!(
+                    "{} is busy ({err}); retrying in {} ms",
+                    dir.display(),
+                    delay.as_millis()
+                );
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_millis(1600));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn archive_error(err: &AppError) -> bool {
+    matches!(err, AppError::Download(_))
+}
+
 async fn rename_retry(from: &Path, to: &Path) -> std::io::Result<()> {
     let deadline = tokio::time::Instant::now() + SWAP_BUDGET;
     let mut delay = Duration::from_millis(100);
@@ -1094,9 +1128,10 @@ async fn refresh_backend(state: &SharedState, gpu: Option<&GpuInfo>) {
             return;
         }
     };
+    let fingerprint = gpu.map(GpuInfo::fingerprint);
     let info = match recorded {
-        Some(info) => refreshed_backend(info, devices),
-        None => inferred_backend(devices),
+        Some(info) => refreshed_backend(info, devices, fingerprint),
+        None => inferred_backend(devices, fingerprint),
     };
     tracing::info!(
         "llama-server in {} checked at startup: build {} ({}), devices {:?}",
@@ -1105,8 +1140,35 @@ async fn refresh_backend(state: &SharedState, gpu: Option<&GpuInfo>) {
         info.tag,
         info.devices
     );
-    if !state.adopt_llama_backend(current.as_ref(), Some(info)) {
+    if !state.adopt_llama_backend(current.as_ref(), Some(info.clone())) {
         tracing::info!("local AI build changed during the startup check; result discarded");
+        return;
+    }
+    if persistable(&info) {
+        persist_backend(state, dir, info).await;
+    } else {
+        tracing::info!("graphics device missing from the local AI build; it will be checked again next start");
+    }
+}
+
+fn persistable(info: &BackendInfo) -> bool {
+    info.device_prefix().is_none() || info.gpu_ready()
+}
+
+async fn persist_backend(state: &SharedState, dir: PathBuf, info: BackendInfo) {
+    let Ok(_files) = state.llama_files.try_lock() else {
+        tracing::info!("local AI setup running; {BACKEND_FILE} left to it");
+        return;
+    };
+    let unchanged = state.llama_backend.read().as_ref() == Some(&info);
+    if !unchanged {
+        tracing::info!("local AI build changed before {BACKEND_FILE} was updated; skipped");
+        return;
+    }
+    let target = dir.clone();
+    match blocking(move || write_backend(&target, &info)).await {
+        Ok(()) => tracing::info!("{} updated after the startup check", dir.join(BACKEND_FILE).display()),
+        Err(err) => tracing::warn!("{} not updated: {err}", dir.join(BACKEND_FILE).display()),
     }
 }
 
@@ -1114,13 +1176,18 @@ fn backend_stale(info: &BackendInfo, gpu: Option<&GpuInfo>) -> bool {
     info.gpu_fingerprint != gpu.map(GpuInfo::fingerprint)
 }
 
-fn refreshed_backend(mut info: BackendInfo, devices: Vec<BackendDevice>) -> BackendInfo {
+fn refreshed_backend(
+    mut info: BackendInfo,
+    devices: Vec<BackendDevice>,
+    fingerprint: Option<String>,
+) -> BackendInfo {
     info.devices = devices;
     info.gpu_name = info.gpu_device_name();
+    info.gpu_fingerprint = fingerprint;
     info
 }
 
-fn inferred_backend(devices: Vec<BackendDevice>) -> BackendInfo {
+fn inferred_backend(devices: Vec<BackendDevice>, fingerprint: Option<String>) -> BackendInfo {
     let listed = |prefix: &str| devices.iter().any(|device| device.id.starts_with(prefix));
     let variant = if listed("CUDA") {
         "cuda"
@@ -1135,7 +1202,7 @@ fn inferred_backend(devices: Vec<BackendDevice>) -> BackendInfo {
         devices,
         gpu_name: None,
         failed_gpu: None,
-        gpu_fingerprint: None,
+        gpu_fingerprint: fingerprint,
     };
     info.gpu_name = info.gpu_device_name();
     info
@@ -1573,7 +1640,12 @@ fn extract_zip(archive: &Path, out_dir: &Path) -> AppResult<()> {
             std::fs::create_dir_all(parent)?;
         }
         let mut dest = std::fs::File::create(&out)?;
-        std::io::copy(&mut entry, &mut dest)?;
+        std::io::copy(&mut entry, &mut dest).map_err(|err| match err.kind() {
+            std::io::ErrorKind::InvalidData
+            | std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::UnexpectedEof => AppError::Download(err.to_string()),
+            _ => AppError::from(err),
+        })?;
     }
     Ok(())
 }
@@ -2103,22 +2175,24 @@ mod tests {
 
     #[test]
     fn inferred_backend_follows_the_listed_devices() {
-        let cuda = inferred_backend(vec![device("CUDA0", "NVIDIA GeForce RTX 5070")]);
+        let cuda = inferred_backend(vec![device("CUDA0", "NVIDIA GeForce RTX 5070")], None);
         assert_eq!(cuda.variant, "cuda");
         assert_eq!(cuda.tag, INFERRED_TAG);
         assert!(cuda.gpu_ready());
         assert_eq!(cuda.gpu_name.as_deref(), Some("NVIDIA GeForce RTX 5070"));
-        let vulkan = inferred_backend(vec![device("Vulkan0", "AMD Radeon")]);
+        let vulkan = inferred_backend(vec![device("Vulkan0", "AMD Radeon")], None);
         assert_eq!(vulkan.variant, "vulkan");
         assert!(vulkan.gpu_ready());
-        let both = inferred_backend(vec![device("Vulkan0", "AMD"), device("CUDA0", "NVIDIA")]);
+        let both = inferred_backend(vec![device("Vulkan0", "AMD"), device("CUDA0", "NVIDIA")], None);
         assert_eq!(both.variant, "cuda");
         assert_eq!(both.gpu_name.as_deref(), Some("NVIDIA"));
-        let none = inferred_backend(Vec::new());
+        let gpu = nvidia(Some("12.0"), Some("610.88"));
+        let none = inferred_backend(Vec::new(), Some(gpu.fingerprint()));
         assert_eq!(none.variant, "cpu");
         assert!(!none.gpu_ready());
         assert_eq!(none.gpu_name, None);
-        let gpu = nvidia(Some("12.0"), Some("610.88"));
+        assert_eq!(none.gpu_fingerprint, Some(gpu.fingerprint()));
+        assert!(!backend_stale(&none, Some(&gpu)));
         assert!(repairable_for(Some(&gpu), true, Some(&none)));
     }
 
@@ -2132,14 +2206,25 @@ mod tests {
         assert!(backend_stale(&info, None));
         assert!(backend_stale(&backend("cuda-13.4", &["CUDA0"]), Some(&gpu)));
         assert!(!backend_stale(&backend("cpu", &[]), None));
-        let refreshed = refreshed_backend(info.clone(), Vec::new());
+        let updated = nvidia(Some("12.0"), Some("612.10"));
+        let refreshed = refreshed_backend(info.clone(), Vec::new(), Some(updated.fingerprint()));
         assert_eq!(refreshed.variant, "cuda-13.4");
         assert!(!refreshed.gpu_ready());
         assert_eq!(refreshed.gpu_name, None);
-        let back = refreshed_backend(refreshed, vec![device("CUDA0", "RTX 5070")]);
+        assert!(!persistable(&refreshed));
+        let back = refreshed_backend(
+            refreshed,
+            vec![device("CUDA0", "RTX 5070")],
+            Some(updated.fingerprint()),
+        );
         assert!(back.gpu_ready());
         assert_eq!(back.gpu_name.as_deref(), Some("RTX 5070"));
-        assert_eq!(back.gpu_fingerprint, info.gpu_fingerprint);
+        assert_eq!(back.gpu_fingerprint, Some(updated.fingerprint()));
+        assert!(!backend_stale(&back, Some(&updated)));
+        assert!(persistable(&back));
+        assert!(persistable(&backend("cpu", &[])));
+        assert!(persistable(&backend("metal", &[])));
+        assert!(!persistable(&backend("vulkan", &[])));
         let text = serde_json::to_string(&info).unwrap_or_default();
         let parsed: Option<BackendInfo> = serde_json::from_str(&text).ok();
         assert_eq!(parsed, Some(info));
@@ -2250,5 +2335,66 @@ mod tests {
         assert!(!safe_asset_name("../evil.zip"));
         assert!(!safe_asset_name("a/b.zip"));
         assert!(!safe_asset_name(""));
+    }
+
+    #[test]
+    fn only_archive_errors_discard_downloads() {
+        assert!(archive_error(&AppError::Download("invalid Zip archive".to_string())));
+        assert!(!archive_error(&AppError::Io("could not clear stage".to_string())));
+        assert!(!archive_error(&AppError::Other("background task failed".to_string())));
+    }
+
+    #[test]
+    fn corrupt_zip_is_an_archive_error() {
+        let root = scratch_dir("corrupt-zip");
+        assert!(std::fs::create_dir_all(&root).is_ok());
+        let archive = root.join("broken.zip");
+        assert!(std::fs::write(&archive, b"not a zip archive").is_ok());
+        let result = extract_package(&[archive], &root.join(STAGE_DIR));
+        assert!(result.as_ref().is_err_and(archive_error), "{result:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn settle_waits_through_failed_and_starting() {
+        assert_eq!(settled(LlmState::Ready), Some(SidecarOutcome::Ready));
+        assert_eq!(settled(LlmState::Off), Some(SidecarOutcome::Off));
+        assert_eq!(settled(LlmState::Failed), None);
+        assert_eq!(settled(LlmState::Starting), None);
+    }
+
+    #[test]
+    fn clear_dir_retry_removes_and_ignores_missing() {
+        let root = scratch_dir("clear");
+        assert!(std::fs::create_dir_all(root.join("sub")).is_ok());
+        assert!(std::fs::write(root.join("sub").join("a.dll"), b"x").is_ok());
+        assert!(clear_dir_retry(&root, Duration::from_millis(200)).is_ok());
+        assert!(!root.exists());
+        assert!(clear_dir_retry(&root, Duration::from_millis(200)).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn clear_dir_retry_waits_for_a_locked_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = scratch_dir("clear-locked");
+        assert!(std::fs::create_dir_all(&root).is_ok());
+        let file = root.join("ggml-cuda.dll");
+        assert!(std::fs::write(&file, b"x").is_ok());
+        let lock = std::fs::OpenOptions::new().read(true).share_mode(0).open(&file);
+        assert!(lock.is_ok());
+        let quick = clear_dir_retry(&root, Duration::from_millis(250));
+        assert!(quick.as_ref().is_err_and(is_sharing_violation), "{quick:?}");
+        assert!(root.exists());
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            drop(lock);
+        });
+        let started = std::time::Instant::now();
+        let patient = clear_dir_retry(&root, Duration::from_secs(5));
+        let _ = release.join();
+        assert!(patient.is_ok(), "{patient:?}");
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert!(!root.exists());
     }
 }

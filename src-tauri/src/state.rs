@@ -2,7 +2,7 @@ use crate::audio::AudioEngine;
 use crate::cleanup::LlmClient;
 use crate::config::{LlmBackend, Settings, TranscriptionBackend};
 use crate::error::{AppError, AppResult};
-use crate::hardware::{self, GpuInfo, GpuMark, MarkRead, WhisperGpu};
+use crate::hardware::{self, GpuInfo, GpuMark, WhisperGpu};
 use crate::llama_setup::BackendInfo;
 use crate::sidecar::Sidecar;
 use crate::transcribe::TranscribeEngine;
@@ -115,6 +115,7 @@ pub struct AppState {
     pub bin_dir: PathBuf,
     pub resource_dir: PathBuf,
     pub log_dir: PathBuf,
+    pub guard_dir: PathBuf,
     pub custom_models: RwLock<crate::custom_models::CustomStore>,
     pub custom_models_path: PathBuf,
     pub llama_setup_running: AtomicBool,
@@ -502,7 +503,7 @@ impl AppState {
     }
 
     fn guard_file(&self, name: &str) -> PathBuf {
-        self.config_path.with_file_name(name)
+        self.guard_dir.join(name)
     }
 
     fn app_version(&self) -> String {
@@ -521,26 +522,30 @@ impl AppState {
         if !hardware::whisper_gpu_guarded() {
             return;
         }
-        let pending = self.guard_file(hardware::WHISPER_GPU_PENDING);
-        match hardware::read_mark(&pending) {
-            MarkRead::Missing => return,
-            MarkRead::Found(mark) => {
-                tracing::warn!(
-                    "whisper did not finish its last graphics card step (card {}, app {}); whisper stays on the processor for this card and version",
-                    mark.gpu,
-                    mark.version
-                );
-                if hardware::write_mark(&self.guard_file(hardware::WHISPER_GPU_BLOCKED), &mark) {
-                    self.whisper_gpu_recovered.store(true, Ordering::Release);
-                } else {
-                    tracing::error!("whisper graphics card block could not be saved");
-                }
-            }
-            MarkRead::Invalid => {
-                tracing::warn!("whisper graphics card crash marker is unusable; ignoring it");
+        if let Some(config_dir) = self.config_path.parent() {
+            if config_dir != self.guard_dir.as_path() {
+                hardware::remove_legacy_marks(config_dir);
             }
         }
-        hardware::remove_mark(&pending);
+        if let Err(err) = std::fs::create_dir_all(&self.guard_dir) {
+            tracing::warn!("could not create {}: {err}", self.guard_dir.display());
+        }
+        if hardware::recover_whisper_marks(&self.guard_dir) {
+            self.whisper_gpu_recovered.store(true, Ordering::Release);
+        }
+        crate::transcribe::set_crash_paths(
+            self.guard_file(hardware::WHISPER_GPU_PENDING),
+            self.guard_file(hardware::WHISPER_GPU_CRASHED),
+        );
+    }
+
+    pub fn clear_whisper_pending(&self) {
+        if !hardware::whisper_gpu_guarded() {
+            return;
+        }
+        let _armed = self.whisper_guard.lock();
+        crate::transcribe::mirror_armed(0);
+        hardware::remove_mark(&self.guard_file(hardware::WHISPER_GPU_PENDING));
     }
 
     fn arm_whisper_guard(&self, mark: &GpuMark) -> Option<WhisperGuard<'_>> {
@@ -549,12 +554,14 @@ impl AppState {
             return None;
         }
         *armed = armed.saturating_add(1);
+        crate::transcribe::mirror_armed(*armed);
         Some(WhisperGuard { state: self })
     }
 
     fn disarm_whisper_guard(&self) {
         let mut armed = self.whisper_guard.lock();
         *armed = armed.saturating_sub(1);
+        crate::transcribe::mirror_armed(*armed);
         if *armed == 0 {
             hardware::remove_mark(&self.guard_file(hardware::WHISPER_GPU_PENDING));
         }
@@ -574,16 +581,20 @@ impl AppState {
     }
 
     fn whisper_gpu_plan(&self, prefer_gpu: bool) -> (bool, Option<GpuMark>) {
-        if !prefer_gpu {
+        let guarded = hardware::whisper_gpu_guarded();
+        if !prefer_gpu && !guarded {
             return (false, None);
         }
-        let guarded = hardware::whisper_gpu_guarded();
         let gpu = if guarded {
             hardware::gpu_blocking(false)
         } else {
             None
         };
         let gate = hardware::whisper_gpu(gpu.as_ref(), self.whisper_gpu_blocked(gpu.as_ref()));
+        hardware::decide_cuda_visibility(gate);
+        if !prefer_gpu {
+            return (false, None);
+        }
         self.note_whisper_gpu_gate(gate);
         if !gate.allowed() {
             let card = gpu
@@ -756,6 +767,7 @@ impl AppState {
             && !crate::pipeline::CANCEL.load(Ordering::Acquire)
         {
             *engine.gpu_check.lock() = None;
+            hardware::remove_mark(&self.guard_file(hardware::WHISPER_GPU_STRIKES));
             tracing::info!("whisper finished its first transcription on the graphics card");
         }
         let text = result?;

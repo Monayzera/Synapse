@@ -72,9 +72,9 @@ pub fn run() {
     #[cfg(not(windows))]
     let primary = true;
 
-    let log_dir = app_local_dir(&identifier)
-        .map(|dir| dir.join("logs"))
-        .unwrap_or_else(|| std::env::temp_dir().join("Synapse").join("logs"));
+    let local_dir =
+        app_local_dir(&identifier).unwrap_or_else(|| std::env::temp_dir().join("Synapse"));
+    let log_dir = local_dir.join("logs");
     init_tracing(&log_dir, primary);
     log_banner(&version, autostart_launch);
     #[cfg(windows)]
@@ -107,7 +107,7 @@ pub fn run() {
     let setup_log_dir = log_dir.clone();
     let built = builder
         .setup(move |app| {
-            setup(app, autostart_launch, setup_log_dir);
+            setup(app, autostart_launch, setup_log_dir, local_dir);
             Ok(())
         })
         .on_window_event(|window, event| match event {
@@ -183,6 +183,7 @@ pub fn run() {
             tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
         ) {
             if let Some(state) = handle.try_state::<SharedState>() {
+                state.clear_whisper_pending();
                 widget_pos::flush(&state);
                 state.stop_sidecar();
             }
@@ -190,7 +191,7 @@ pub fn run() {
     });
 }
 
-fn setup(app: &mut tauri::App, autostart_launch: bool, log_dir: PathBuf) {
+fn setup(app: &mut tauri::App, autostart_launch: bool, log_dir: PathBuf, guard_dir: PathBuf) {
     let handle = app.handle().clone();
 
     let base_dir = resolve_base_dir(&handle);
@@ -282,6 +283,7 @@ fn setup(app: &mut tauri::App, autostart_launch: bool, log_dir: PathBuf) {
         bin_dir,
         resource_dir,
         log_dir,
+        guard_dir,
         custom_models: RwLock::new(custom_store),
         custom_models_path,
         llama_setup_running: AtomicBool::new(false),

@@ -48,18 +48,28 @@ Var SynapseCpuAutostart
       ClearErrors
       ExecWait '"$1\uninstall.exe" /S _?=$1' $0
       ${IfThen} ${Errors} ${|} StrCpy $0 2 ${|}
-      Delete "$1\uninstall.exe"
-      ${If} $1 != $INSTDIR
-        RMDir "$1"
+      ${If} $0 == 0
+        Delete "$1\uninstall.exe"
+        ${If} $1 != $INSTDIR
+          RMDir "$1"
+        ${EndIf}
       ${EndIf}
     ${EndIf}
     DetailPrint "${SYNAPSE_CPU_NAME} uninstaller result: $0"
-    DeleteRegValue HKCU "${SYNAPSE_RUNKEY}" "${SYNAPSE_CPU_NAME}"
-    DeleteRegValue HKCU "${SYNAPSE_APPROVEDKEY}" "${SYNAPSE_CPU_NAME}"
-    Delete "$SMPROGRAMS\${SYNAPSE_CPU_NAME}.lnk"
-    Delete "$DESKTOP\${SYNAPSE_CPU_NAME}.lnk"
-    DeleteRegKey HKCU "${SYNAPSE_CPU_UNINSTKEY}"
-    DeleteRegKey HKCU "${SYNAPSE_CPU_PRODUCTKEY}"
+    ${If} $0 == "not run"
+    ${OrIf} $0 == 0
+      DeleteRegValue HKCU "${SYNAPSE_RUNKEY}" "${SYNAPSE_CPU_NAME}"
+      DeleteRegValue HKCU "${SYNAPSE_APPROVEDKEY}" "${SYNAPSE_CPU_NAME}"
+      Delete "$SMPROGRAMS\${SYNAPSE_CPU_NAME}.lnk"
+      Delete "$DESKTOP\${SYNAPSE_CPU_NAME}.lnk"
+      DeleteRegKey HKCU "${SYNAPSE_CPU_UNINSTKEY}"
+      DeleteRegKey HKCU "${SYNAPSE_CPU_PRODUCTKEY}"
+    ${Else}
+      DetailPrint "${SYNAPSE_CPU_NAME} could not be removed automatically; its registration, shortcuts and autostart are kept"
+      StrCpy $SynapseCpuStartMenu 0
+      StrCpy $SynapseCpuDesktop 0
+      StrCpy $SynapseCpuAutostart 0
+    ${EndIf}
   ${EndIf}
   Pop $2
   Pop $1
@@ -94,12 +104,6 @@ Var SynapseCpuAutostart
     ReadRegStr $0 HKCU "${SYNAPSE_RUNKEY}" "${PRODUCTNAME}"
     ${If} $0 == ""
       WriteRegStr HKCU "${SYNAPSE_RUNKEY}" "${PRODUCTNAME}" '"$INSTDIR\${MAINBINARYNAME}.exe" --autostart'
-    ${EndIf}
-  ${EndIf}
-  ${IfNot} ${FileExists} "$LOCALAPPDATA\${BUNDLEID}\data_root"
-    ${If} ${FileExists} "$LOCALAPPDATA\${SYNAPSE_CPU_BUNDLEID}\data_root"
-      CreateDirectory "$LOCALAPPDATA\${BUNDLEID}"
-      CopyFiles /SILENT "$LOCALAPPDATA\${SYNAPSE_CPU_BUNDLEID}\data_root" "$LOCALAPPDATA\${BUNDLEID}"
     ${EndIf}
   ${EndIf}
   ${If} ${FileExists} "$LOCALAPPDATA\${SYNAPSE_CPU_BUNDLEID}\updates\*.*"

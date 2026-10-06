@@ -1,7 +1,7 @@
 use crate::config::{LlmBackend, LoadOutcome, Settings, TranscriptionBackend};
 use crate::error::{AppError, AppResult};
 use crate::models::{self, ModelInfo, ModelKind};
-use crate::sidecar::{self, Liveness, Sidecar, Startup};
+use crate::sidecar::{self, Liveness, Owner, Sidecar, Startup};
 use crate::state::{LlmState, SharedState};
 use crate::{autostart, hotkey};
 use std::path::{Path, PathBuf};
@@ -25,11 +25,12 @@ const PRIME_TIMEOUT: Duration = Duration::from_secs(120);
 const PRIME_TEXT: &str = "<<<BEGIN_TRANSCRIPT>>>\nok\n<<<END_TRANSCRIPT>>>";
 pub const LOCAL_PORT: u16 = 8123;
 pub const LOCAL_ENDPOINT: &str = "http://127.0.0.1:8123/v1";
-const LOCAL_MODEL_NAME: &str = "local";
+pub const LOCAL_MODEL_NAME: &str = "local";
 const GPU_LOAD_FAILURES: u32 = 2;
 const GPU_FALLBACK_NOTICE: &str = "The graphics card could not run the local AI, so it is running on the processor for now. Use Repair to reinstall the graphics files.";
 
 static PRIME_GEN: AtomicU64 = AtomicU64::new(0);
+static WATCH_GAVE_UP: AtomicU64 = AtomicU64::new(0);
 static PRIME_STATE: parking_lot::Mutex<PrimeState> =
     parking_lot::Mutex::new(PrimeState { busy: false, again: false });
 
@@ -52,6 +53,7 @@ enum Launch {
     Ready,
     LoadFailed,
     SpawnFailed,
+    PortBusy,
     Superseded,
 }
 
@@ -59,7 +61,7 @@ impl Launch {
     fn outcome(self) -> SidecarOutcome {
         match self {
             Launch::Ready => SidecarOutcome::Ready,
-            Launch::LoadFailed | Launch::SpawnFailed => SidecarOutcome::Failed,
+            Launch::LoadFailed | Launch::SpawnFailed | Launch::PortBusy => SidecarOutcome::Failed,
             Launch::Superseded => SidecarOutcome::Superseded,
         }
     }
@@ -179,7 +181,8 @@ async fn start_sidecar(
         return Launch::Superseded;
     }
     let log_path = state.log_dir.join("llama-server.log");
-    let child = match Sidecar::spawn(exe, model, port, gpu_layers, SIDECAR_CTX, &log_path) {
+    let alias = sidecar_alias(generation);
+    let child = match Sidecar::spawn(exe, model, port, gpu_layers, SIDECAR_CTX, &alias, &log_path) {
         Ok(child) => child,
         Err(err) => {
             tracing::warn!("could not start llama-server: {err}");
@@ -215,6 +218,19 @@ async fn start_sidecar(
 
     match startup {
         Startup::Ready => {
+            match sidecar::probe_owner(state.llm.http(), port, model, &alias).await {
+                Owner::Ours => {}
+                Owner::Unverified if child_running(state) => {}
+                Owner::Foreign | Owner::Unverified => {
+                    return fail_start(state, generation, port_busy(port), Launch::PortBusy)
+                }
+                Owner::Unknown => {
+                    let reason = format!(
+                        "the server answering on port {port} could not be identified as the local AI"
+                    );
+                    return fail_start(state, generation, reason, Launch::LoadFailed);
+                }
+            }
             if !state.publish_llm_state(generation, LlmState::Ready, true) {
                 return Launch::Superseded;
             }
@@ -228,8 +244,11 @@ async fn start_sidecar(
         Startup::Superseded => Launch::Superseded,
         Startup::Exited | Startup::TimedOut => {
             take_child_if_current(state, generation);
-            if !state.publish_llm_state(generation, LlmState::Failed, false) {
-                return Launch::Superseded;
+            if matches!(
+                sidecar::probe_owner(state.llm.http(), port, model, &alias).await,
+                Owner::Foreign | Owner::Unverified
+            ) {
+                return fail_start(state, generation, port_busy(port), Launch::PortBusy);
             }
             let reason = if startup == Startup::Exited {
                 "the local AI server stopped while starting (see llama-server.log)".to_string()
@@ -239,11 +258,36 @@ async fn start_sidecar(
                     SIDECAR_READY_TIMEOUT.as_secs()
                 )
             };
-            tracing::warn!("llama-server did not become ready: {reason}");
-            state.set_local_ai_error(Some(reason));
-            Launch::LoadFailed
+            fail_start(state, generation, reason, Launch::LoadFailed)
         }
     }
+}
+
+fn fail_start(state: &SharedState, generation: u64, reason: String, launch: Launch) -> Launch {
+    take_child_if_current(state, generation);
+    if !state.publish_llm_state(generation, LlmState::Failed, false) {
+        return Launch::Superseded;
+    }
+    tracing::warn!("llama-server did not become ready: {reason}");
+    state.set_local_ai_error(Some(reason));
+    launch
+}
+
+fn port_busy(port: u16) -> String {
+    format!("port {port} in use by another program")
+}
+
+fn sidecar_alias(generation: u64) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("synapse-{}-{generation}-{nanos}", std::process::id())
+}
+
+pub fn retries_exhausted(state: &SharedState) -> bool {
+    let generation = state.sidecar_gen.load(Ordering::Acquire);
+    generation != 0 && WATCH_GAVE_UP.load(Ordering::Acquire) == generation
 }
 
 pub fn schedule_prime(state: &SharedState, delay: Duration) {
@@ -386,6 +430,7 @@ async fn watch_sidecar(
             tracing::error!(
                 "local AI server failed after {restarts} restarts; waiting for a settings change, resume or manual restart"
             );
+            WATCH_GAVE_UP.store(generation, Ordering::Release);
             return;
         }
         restarts = restarts.saturating_add(1);
@@ -682,7 +727,7 @@ pub fn spawn_whisper_gpu_notice(app: AppHandle) {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        crate::pipeline::emit_info(
+        crate::pipeline::emit_error(
             &app,
             "transcription",
             crate::state::WHISPER_GPU_DISABLED,
@@ -691,24 +736,9 @@ pub fn spawn_whisper_gpu_notice(app: AppHandle) {
     });
 }
 
-fn adopt_legacy_autostart(state: &SharedState, enabled: bool) -> bool {
-    if !autostart::remove_legacy_cpu_entry() || enabled {
-        return enabled;
-    }
-    let changed = state.mutate_settings(|settings| {
-        settings.autostart = true;
-        Ok(())
-    });
-    match changed {
-        Ok(_) => {
-            tracing::info!("autostart carried over from Synapse CPU");
-            state.emit_settings_changed();
-            true
-        }
-        Err(err) => {
-            tracing::warn!("autostart could not be carried over from Synapse CPU: {err}");
-            enabled
-        }
+fn drop_legacy_autostart() {
+    if autostart::remove_legacy_cpu_entry() {
+        tracing::info!("stale Synapse CPU autostart entry removed");
     }
 }
 
@@ -739,8 +769,8 @@ pub fn bootstrap(app: &AppHandle, state: &SharedState, migrated: bool) {
         spawn_settings_recovery(app.clone(), state.clone());
         spawn_unreadable_notice(state.clone());
     } else {
-        let desired = adopt_legacy_autostart(state, settings.autostart);
-        autostart::reconcile(app, desired);
+        drop_legacy_autostart();
+        autostart::reconcile(app, settings.autostart);
     }
 
     if migrated {
@@ -779,8 +809,13 @@ pub fn bootstrap(app: &AppHandle, state: &SharedState, migrated: bool) {
         if local_wanted && local_install(state, &settings).is_some() {
             state.set_llm_state(LlmState::Starting);
         }
+        let checked_generation = state.sidecar_gen.load(Ordering::Acquire);
         tauri::async_runtime::spawn(async move {
-            check_local_ai(&sidecar_state).await;
+            let raised = check_local_ai(&sidecar_state).await;
+            if !raised && sidecar_state.sidecar_gen.load(Ordering::Acquire) != checked_generation {
+                tracing::info!("local AI server already restarted during the startup check");
+                return;
+            }
             restart_sidecar(&sidecar_state).await;
         });
     }
@@ -861,6 +896,25 @@ mod tests {
             (Launch::LoadFailed, true),
         ]);
         assert!(!gpu_fallback_due(99, superseded));
+        let port_busy = run(&[
+            (Launch::LoadFailed, true),
+            (Launch::PortBusy, true),
+            (Launch::LoadFailed, true),
+        ]);
+        assert!(!gpu_fallback_due(99, port_busy));
+        assert_eq!(run(&[(Launch::PortBusy, true), (Launch::PortBusy, true)]), 0);
+        assert_eq!(Launch::PortBusy.outcome(), SidecarOutcome::Failed);
+    }
+
+    #[test]
+    fn sidecar_alias_is_unique_per_launch() {
+        let first = sidecar_alias(7);
+        let second = sidecar_alias(8);
+        assert!(first.starts_with("synapse-"));
+        assert!(first.contains("-7-"));
+        assert_ne!(first, second);
+        assert!(first.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+        assert_eq!(port_busy(LOCAL_PORT), "port 8123 in use by another program");
     }
 
     #[test]

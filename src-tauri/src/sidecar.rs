@@ -24,6 +24,7 @@ impl Sidecar {
         port: u16,
         n_gpu_layers: i32,
         ctx_size: u32,
+        alias: &str,
         log_path: &Path,
     ) -> AppResult<Sidecar> {
         if !exe.exists() {
@@ -53,7 +54,10 @@ impl Sidecar {
             .arg("-np")
             .arg("1")
             .arg("--swa-full")
-            .arg("--no-ui");
+            .arg("--no-ui")
+            .arg("--alias")
+            .arg(alias)
+            .env_remove("CUDA_VISIBLE_DEVICES");
 
         if let Some(dir) = exe.parent() {
             let current = std::env::var("PATH").unwrap_or_default();
@@ -138,6 +142,97 @@ pub async fn health_ok(client: &reqwest::Client, port: u16) -> bool {
         tokio::time::timeout(Duration::from_secs(2), client.get(&url).send()).await,
         Ok(Ok(response)) if response.status().is_success()
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Owner {
+    Ours,
+    Foreign,
+    Unverified,
+    Unknown,
+}
+
+pub async fn probe_owner(client: &reqwest::Client, port: u16, model: &Path, alias: &str) -> Owner {
+    let url = format!("http://127.0.0.1:{port}/props");
+    let expected = model.to_string_lossy();
+    for attempt in 0..2 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let exchange = async {
+            let response = client.get(&url).send().await?;
+            let status = response.status();
+            let body = response.bytes().await?;
+            Ok::<_, reqwest::Error>((status, body))
+        };
+        match tokio::time::timeout(Duration::from_secs(3), exchange).await {
+            Ok(Ok((status, body))) => {
+                let props = serde_json::from_slice::<serde_json::Value>(&body).ok();
+                let owner = judge_owner(status.as_u16(), props.as_ref(), &expected, alias);
+                if owner != Owner::Unknown {
+                    if owner == Owner::Foreign {
+                        tracing::warn!(
+                            "port {port} is answered by another server (HTTP {}, model {:?}, alias {:?})",
+                            status.as_u16(),
+                            props_text(props.as_ref(), "model_path"),
+                            props_text(props.as_ref(), "model_alias")
+                        );
+                    } else if owner == Owner::Unverified {
+                        tracing::warn!(
+                            "llama-server props on port {port} list neither model_path nor model_alias (build {:?}); ownership not verifiable",
+                            props_text(props.as_ref(), "build_info")
+                        );
+                    }
+                    return owner;
+                }
+            }
+            Ok(Err(err)) => tracing::debug!("llama-server props on port {port} unavailable: {err}"),
+            Err(_) => tracing::debug!("llama-server props on port {port} timed out"),
+        }
+    }
+    Owner::Unknown
+}
+
+fn props_text<'a>(props: Option<&'a serde_json::Value>, key: &str) -> Option<&'a str> {
+    props?.get(key)?.as_str()
+}
+
+fn judge_owner(status: u16, props: Option<&serde_json::Value>, expected: &str, alias: &str) -> Owner {
+    if status == 503 {
+        return Owner::Unknown;
+    }
+    if !(200..300).contains(&status) {
+        return Owner::Foreign;
+    }
+    let Some(props) = props.filter(|value| value.is_object()) else {
+        return Owner::Foreign;
+    };
+    let served_path = props_text(Some(props), "model_path");
+    let served_alias = props_text(Some(props), "model_alias");
+    if served_path.is_none() && served_alias.is_none() {
+        return Owner::Unverified;
+    }
+    let path_bad = served_path.is_some_and(|served| !same_model_path(served, expected, cfg!(windows)));
+    let alias_bad = served_alias.is_some_and(|served| served != alias);
+    if path_bad || alias_bad {
+        Owner::Foreign
+    } else {
+        Owner::Ours
+    }
+}
+
+fn same_model_path(served: &str, expected: &str, windows: bool) -> bool {
+    let normalize = |path: &str| -> String {
+        let path = path.trim();
+        if windows {
+            let path = path.strip_prefix(r"\\?\").unwrap_or(path);
+            path.replace('/', "\\").trim_end_matches('\\').to_lowercase()
+        } else {
+            path.trim_end_matches('/').to_string()
+        }
+    };
+    let served = normalize(served);
+    !served.is_empty() && served == normalize(expected)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,5 +427,79 @@ mod tests {
         assert_eq!(physical_estimate(2), 2);
         assert_eq!(physical_estimate(1), 2);
         assert_eq!(physical_estimate(0), 2);
+    }
+
+    #[test]
+    fn model_paths_compare_like_the_platform() {
+        let real = r"C:\Users\puhlm\Documents\Synapse\data\models\google_gemma-3-4b-it-Q4_K_M.gguf";
+        assert!(same_model_path(real, real, true));
+        assert!(same_model_path(
+            r"c:/users/PUHLM/Documents/Synapse/data/models/google_gemma-3-4b-it-Q4_K_M.gguf",
+            real,
+            true
+        ));
+        assert!(same_model_path(&format!(r"\\?\{real}"), real, true));
+        assert!(same_model_path(
+            r"C:\Users\João\Documents\Synapse\models\Gemma.gguf",
+            r"C:\Users\JOÃO\Documents\Synapse\models\gemma.gguf",
+            true
+        ));
+        assert!(!same_model_path(
+            r"C:\Users\puhlm\Documents\Synapse\data\models\other.gguf",
+            real,
+            true
+        ));
+        assert!(!same_model_path("", "", true));
+        assert!(!same_model_path("/home/a/Model.gguf", "/home/a/model.gguf", false));
+        assert!(same_model_path("/home/a/model.gguf", "/home/a/model.gguf", false));
+    }
+
+    #[test]
+    fn server_ownership_needs_our_alias_and_model() {
+        let model = r"C:\Users\puhlm\Documents\Synapse\data\models\google_gemma-3-4b-it-Q4_K_M.gguf";
+        let ours = serde_json::json!({
+            "model_path": model,
+            "model_alias": "synapse-1-2-3",
+            "build_info": "b11433-50569eb87"
+        });
+        assert_eq!(judge_owner(200, Some(&ours), model, "synapse-1-2-3"), Owner::Ours);
+        assert_eq!(judge_owner(200, Some(&ours), model, "synapse-1-2-4"), Owner::Foreign);
+        let default_alias = serde_json::json!({ "model_path": model, "model_alias": model });
+        assert_eq!(
+            judge_owner(200, Some(&default_alias), model, "synapse-1-2-3"),
+            Owner::Foreign
+        );
+        let other_model = serde_json::json!({
+            "model_path": r"C:\models\qwen.gguf",
+            "model_alias": "synapse-1-2-3"
+        });
+        assert_eq!(
+            judge_owner(200, Some(&other_model), model, "synapse-1-2-3"),
+            Owner::Foreign
+        );
+        assert_eq!(judge_owner(200, None, model, "synapse-1-2-3"), Owner::Foreign);
+        let future = serde_json::json!({ "build_info": "b20000-abcdef", "total_slots": 1 });
+        assert_eq!(
+            judge_owner(200, Some(&future), model, "synapse-1-2-3"),
+            Owner::Unverified
+        );
+        let alias_only = serde_json::json!({ "model_alias": "synapse-1-2-3" });
+        assert_eq!(judge_owner(200, Some(&alias_only), model, "synapse-1-2-3"), Owner::Ours);
+        let foreign_alias_only = serde_json::json!({ "model_alias": "other" });
+        assert_eq!(
+            judge_owner(200, Some(&foreign_alias_only), model, "synapse-1-2-3"),
+            Owner::Foreign
+        );
+        let path_only = serde_json::json!({ "model_path": model });
+        assert_eq!(judge_owner(200, Some(&path_only), model, "synapse-1-2-3"), Owner::Ours);
+        let foreign_path_only = serde_json::json!({ "model_path": r"C:\models\qwen.gguf" });
+        assert_eq!(
+            judge_owner(200, Some(&foreign_path_only), model, "synapse-1-2-3"),
+            Owner::Foreign
+        );
+        let not_object = serde_json::json!(["model_path"]);
+        assert_eq!(judge_owner(200, Some(&not_object), model, "synapse-1-2-3"), Owner::Foreign);
+        assert_eq!(judge_owner(404, None, model, "synapse-1-2-3"), Owner::Foreign);
+        assert_eq!(judge_owner(503, None, model, "synapse-1-2-3"), Owner::Unknown);
     }
 }

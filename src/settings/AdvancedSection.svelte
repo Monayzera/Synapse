@@ -32,6 +32,19 @@
   const num = (v: number, digits: number) =>
     v.toLocaleString(locale(), { minimumFractionDigits: digits, maximumFractionDigits: digits });
 
+  const gpuNote = $derived.by(() => {
+    switch (app.hw?.whisper_gpu) {
+      case "no_nvidia":
+        return t("adv.gpuNoNvidia");
+      case "unsupported":
+        return t("adv.gpuUnsupported");
+      case "blocked":
+        return t("adv.gpuBlocked");
+      default:
+        return "";
+    }
+  });
+
   async function runTest(): Promise<{ ok: boolean; detail: string; title?: string }> {
     testMs = 0;
     const result = await testLlm();
@@ -176,6 +189,13 @@
       checked={s.prefer_gpu}
       onchange={(v) => void commit({ prefer_gpu: v })}
     />
+  </div>
+{:else if gpuNote}
+  <div class="group">
+    <span class="group-head">{t("adv.performance")}</span>
+    <div class="item">
+      <span class="field-hint">{gpuNote}</span>
+    </div>
   </div>
 {/if}
 

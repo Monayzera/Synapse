@@ -257,6 +257,22 @@ fn chat_url(base: &str) -> String {
     format!("{}/chat/completions", base.trim_end_matches('/'))
 }
 
+fn chat_target(settings: &Settings) -> (&str, &str, &str) {
+    if matches!(settings.llm_backend, LlmBackend::Local) {
+        (
+            crate::services::LOCAL_ENDPOINT,
+            crate::services::LOCAL_MODEL_NAME,
+            "",
+        )
+    } else {
+        (
+            settings.llm_endpoint.trim(),
+            settings.llm_model_name.trim(),
+            settings.llm_api_key.trim(),
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct LlmContext {
     pub local_gpu: bool,
@@ -816,15 +832,11 @@ impl LlmClient {
             _ => {
                 let local = matches!(settings.llm_backend, LlmBackend::Local);
                 let send_thinking = local || matches!(settings.llm_backend, LlmBackend::Ollama);
-                let base = if local {
-                    crate::services::LOCAL_ENDPOINT.to_string()
-                } else {
-                    settings.llm_endpoint.trim().to_string()
-                };
+                let (base, model, key) = chat_target(settings);
                 self.openai_chat(
-                    &base,
-                    settings.llm_model_name.trim(),
-                    settings.llm_api_key.trim(),
+                    base,
+                    model,
+                    key,
                     system,
                     fenced,
                     settings.llm_temperature,
@@ -1255,6 +1267,35 @@ fn strip_dashes(text: &str, sep: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_requests_never_carry_the_other_provider_identity() {
+        let other = Settings {
+            llm_backend: LlmBackend::Local,
+            llm_endpoint: " https://api.openai.com/v1 ".to_string(),
+            llm_model_name: " gpt-4o-mini ".to_string(),
+            llm_api_key: " sk-secret ".to_string(),
+            ..Settings::default()
+        };
+        assert_eq!(
+            chat_target(&other),
+            (crate::services::LOCAL_ENDPOINT, "local", "")
+        );
+        let remote = Settings {
+            llm_backend: LlmBackend::OpenAiCompatible,
+            ..other.clone()
+        };
+        assert_eq!(
+            chat_target(&remote),
+            ("https://api.openai.com/v1", "gpt-4o-mini", "sk-secret")
+        );
+        let ollama = Settings {
+            llm_backend: LlmBackend::Ollama,
+            llm_api_key: String::new(),
+            ..other
+        };
+        assert_eq!(chat_target(&ollama).2, "");
+    }
 
     #[test]
     fn format_replaces_correction_rule() {

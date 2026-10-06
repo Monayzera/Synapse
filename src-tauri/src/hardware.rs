@@ -1,11 +1,16 @@
 use parking_lot::Mutex;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tauri::Manager;
 
 pub const WHISPER_GPU_PENDING: &str = "whisper_gpu.pending";
+pub const WHISPER_GPU_CRASHED: &str = "whisper_gpu.crashed";
+pub const WHISPER_GPU_STRIKES: &str = "whisper_gpu.strikes";
 pub const WHISPER_GPU_BLOCKED: &str = "whisper_gpu.blocked";
+const WHISPER_GPU_BLOCK_STRIKES: u32 = 2;
 const MARK_REMOVE_ATTEMPTS: u32 = 5;
+const CUDA_VISIBLE_DEVICES: &str = "CUDA_VISIBLE_DEVICES";
 
 #[cfg(windows)]
 const VENDOR_NVIDIA: u32 = 0x10DE;
@@ -22,6 +27,8 @@ const NVIDIA_SMI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 
 static GPU_CACHE: Mutex<Option<Option<GpuInfo>>> = Mutex::new(None);
 static GPU_DETECT: Mutex<()> = Mutex::new(());
+static NVIDIA_ROWS: Mutex<Vec<GpuInfo>> = Mutex::new(Vec::new());
+static CUDA_VISIBILITY: std::sync::Once = std::sync::Once::new();
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -39,6 +46,7 @@ pub struct HardwareInfo {
     pub os: String,
     pub tier: HwTier,
     pub gpu: Option<GpuInfo>,
+    pub whisper_gpu: WhisperGpu,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,7 +113,8 @@ pub fn whisper_cuda_supported(cc: (u32, u32)) -> bool {
     arch_covers(&WHISPER_CUDA_ARCHS, cc)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WhisperGpu {
     Allowed,
     NotCompiled,
@@ -125,7 +134,7 @@ impl WhisperGpu {
             WhisperGpu::NotCompiled => "this build has no GPU support for whisper",
             WhisperGpu::NoNvidia => "no NVIDIA graphics card was found",
             WhisperGpu::Unsupported => {
-                "the NVIDIA graphics card's compute capability is not covered by the bundled whisper GPU kernels"
+                "an NVIDIA graphics card's compute capability is not covered by the bundled whisper GPU kernels"
             }
             WhisperGpu::Blocked => {
                 "the graphics card crashed whisper before; the GPU stays off until the app or the graphics driver changes"
@@ -134,7 +143,17 @@ impl WhisperGpu {
     }
 }
 
-fn whisper_gpu_for(cuda: bool, metal: bool, gpu: Option<&GpuInfo>, blocked: bool) -> WhisperGpu {
+fn uncovered(gpu: &GpuInfo) -> bool {
+    gpu.cc().is_some_and(|cc| !whisper_cuda_supported(cc))
+}
+
+fn whisper_gpu_for(
+    cuda: bool,
+    metal: bool,
+    gpu: Option<&GpuInfo>,
+    nvidia: &[GpuInfo],
+    blocked: bool,
+) -> WhisperGpu {
     if metal {
         return WhisperGpu::Allowed;
     }
@@ -144,7 +163,7 @@ fn whisper_gpu_for(cuda: bool, metal: bool, gpu: Option<&GpuInfo>, blocked: bool
     let Some(gpu) = gpu.filter(|gpu| gpu.vendor == GpuVendor::Nvidia) else {
         return WhisperGpu::NoNvidia;
     };
-    if gpu.cc().is_some_and(|cc| !whisper_cuda_supported(cc)) {
+    if uncovered(gpu) || nvidia.iter().any(uncovered) {
         return WhisperGpu::Unsupported;
     }
     if blocked {
@@ -154,11 +173,25 @@ fn whisper_gpu_for(cuda: bool, metal: bool, gpu: Option<&GpuInfo>, blocked: bool
 }
 
 pub fn whisper_gpu(gpu: Option<&GpuInfo>, blocked: bool) -> WhisperGpu {
-    whisper_gpu_for(cfg!(feature = "cuda"), cfg!(feature = "metal"), gpu, blocked)
+    let nvidia = NVIDIA_ROWS.lock().clone();
+    whisper_gpu_for(cfg!(feature = "cuda"), cfg!(feature = "metal"), gpu, &nvidia, blocked)
 }
 
 pub fn whisper_gpu_guarded() -> bool {
     cfg!(feature = "cuda") && !cfg!(feature = "metal")
+}
+
+pub fn decide_cuda_visibility(gate: WhisperGpu) {
+    CUDA_VISIBILITY.call_once(|| {
+        if !whisper_gpu_guarded() || gate.allowed() {
+            return;
+        }
+        std::env::set_var(CUDA_VISIBLE_DEVICES, "-1");
+        tracing::info!(
+            "CUDA devices are hidden from whisper for this run: {}",
+            gate.reason()
+        );
+    });
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,14 +209,36 @@ impl GpuMark {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuStrikes {
+    pub mark: GpuMark,
+    pub count: u32,
+}
+
+pub fn next_strikes(previous: Option<GpuStrikes>, mark: GpuMark) -> GpuStrikes {
+    let count = match previous {
+        Some(previous) if previous.mark == mark => previous.count.saturating_add(1),
+        _ => 1,
+    };
+    GpuStrikes { mark, count }
+}
+
+pub fn strikes_block(strikes: &GpuStrikes) -> bool {
+    strikes.count >= WHISPER_GPU_BLOCK_STRIKES
+}
+
 #[derive(Debug, PartialEq, Eq)]
-pub enum MarkRead {
+pub enum MarkRead<T = GpuMark> {
     Missing,
-    Found(GpuMark),
+    Found(T),
     Invalid,
 }
 
 pub fn read_mark(path: &Path) -> MarkRead {
+    read_json(path)
+}
+
+fn read_json<T: DeserializeOwned>(path: &Path) -> MarkRead<T> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return MarkRead::Missing,
@@ -192,8 +247,8 @@ pub fn read_mark(path: &Path) -> MarkRead {
             return MarkRead::Invalid;
         }
     };
-    match serde_json::from_str::<GpuMark>(&text) {
-        Ok(mark) => MarkRead::Found(mark),
+    match serde_json::from_str::<T>(&text) {
+        Ok(value) => MarkRead::Found(value),
         Err(err) => {
             tracing::warn!("{} holds invalid data: {err}", path.display());
             MarkRead::Invalid
@@ -201,8 +256,8 @@ pub fn read_mark(path: &Path) -> MarkRead {
     }
 }
 
-pub fn write_mark(path: &Path, mark: &GpuMark) -> bool {
-    let bytes = match serde_json::to_vec(mark) {
+pub fn write_mark<T: Serialize>(path: &Path, value: &T) -> bool {
+    let bytes = match serde_json::to_vec(value) {
         Ok(bytes) => bytes,
         Err(err) => {
             tracing::warn!("{} could not be encoded: {err}", path.display());
@@ -240,6 +295,84 @@ pub fn mark_matches(mark: &MarkRead, gpu: Option<&GpuInfo>, version: &str) -> bo
     match mark {
         MarkRead::Found(mark) => *mark == GpuMark::new(gpu, version),
         MarkRead::Missing | MarkRead::Invalid => false,
+    }
+}
+
+pub fn recover_whisper_marks(dir: &Path) -> bool {
+    let pending = dir.join(WHISPER_GPU_PENDING);
+    let crashed = dir.join(WHISPER_GPU_CRASHED);
+    let strikes = dir.join(WHISPER_GPU_STRIKES);
+    let blocked = dir.join(WHISPER_GPU_BLOCKED);
+    match read_json::<GpuMark>(&crashed) {
+        MarkRead::Found(mark) => {
+            tracing::warn!(
+                "whisper crashed on the graphics card (card {}, app {}); whisper stays on the processor for this card and version",
+                mark.gpu,
+                mark.version
+            );
+            let saved = write_mark(&blocked, &mark);
+            if saved {
+                remove_mark(&crashed);
+                remove_mark(&strikes);
+            } else {
+                tracing::error!("whisper graphics card block could not be saved; the crash record is kept for the next start");
+            }
+            remove_mark(&pending);
+            return saved;
+        }
+        MarkRead::Invalid => {
+            tracing::warn!("whisper graphics card crash record is unusable; ignoring it");
+            remove_mark(&crashed);
+        }
+        MarkRead::Missing => {}
+    }
+    let mut recovered = false;
+    match read_json::<GpuMark>(&pending) {
+        MarkRead::Found(mark) => {
+            let previous = match read_json::<GpuStrikes>(&strikes) {
+                MarkRead::Found(previous) => Some(previous),
+                MarkRead::Missing | MarkRead::Invalid => None,
+            };
+            let next = next_strikes(previous, mark);
+            if strikes_block(&next) {
+                tracing::warn!(
+                    "whisper was interrupted {} times in a row during a graphics card step (card {}, app {}); whisper stays on the processor for this card and version",
+                    next.count,
+                    next.mark.gpu,
+                    next.mark.version
+                );
+                if write_mark(&blocked, &next.mark) {
+                    recovered = true;
+                    remove_mark(&strikes);
+                } else {
+                    tracing::error!("whisper graphics card block could not be saved");
+                }
+            } else {
+                tracing::info!(
+                    "whisper was interrupted during a graphics card step (card {}, app {}); not treated as a crash yet ({} of {})",
+                    next.mark.gpu,
+                    next.mark.version,
+                    next.count,
+                    WHISPER_GPU_BLOCK_STRIKES
+                );
+                write_mark(&strikes, &next);
+            }
+        }
+        MarkRead::Invalid => {
+            tracing::warn!("whisper graphics card step marker is unusable; ignoring it");
+        }
+        MarkRead::Missing => {}
+    }
+    remove_mark(&pending);
+    recovered
+}
+
+pub fn remove_legacy_marks(dir: &Path) {
+    for name in [WHISPER_GPU_PENDING, WHISPER_GPU_BLOCKED] {
+        let path = dir.join(name);
+        if matches!(path.try_exists(), Ok(true)) && remove_mark(&path) {
+            tracing::info!("removed the old whisper graphics card marker {}", path.display());
+        }
     }
 }
 
@@ -418,7 +551,8 @@ fn nvidia_smi() -> Vec<GpuInfo> {
             let mut command = std::process::Command::new(&exe);
             command
                 .arg(format!("--query-gpu={query}"))
-                .arg("--format=csv,noheader");
+                .arg("--format=csv,noheader")
+                .env_remove(CUDA_VISIBLE_DEVICES);
             match crate::sidecar::run_capture(command, NVIDIA_SMI_TIMEOUT) {
                 Ok(text) => {
                     let rows = parse_nvidia_smi(&text, with_cc);
@@ -437,27 +571,31 @@ fn nvidia_smi() -> Vec<GpuInfo> {
 }
 
 #[cfg(windows)]
-fn detect_gpu() -> Option<GpuInfo> {
+fn detect_gpu() -> (Option<GpuInfo>, Vec<GpuInfo>) {
     let adapters = dxgi_adapters();
-    let best = pick_adapter(&adapters)?;
+    let Some(best) = pick_adapter(&adapters) else {
+        return (None, Vec::new());
+    };
     let mut info = GpuInfo {
         vendor: best.vendor,
         name: best.name.clone(),
         compute_cap: None,
         driver_version: None,
     };
-    if best.vendor == GpuVendor::Nvidia {
-        let rows = nvidia_smi();
-        if let Some(row) = pick_nvidia(&rows) {
-            info = row.clone();
-        }
+    let rows = if best.vendor == GpuVendor::Nvidia {
+        nvidia_smi()
+    } else {
+        Vec::new()
+    };
+    if let Some(row) = pick_nvidia(&rows) {
+        info = row.clone();
     }
-    Some(info)
+    (Some(info), rows)
 }
 
 #[cfg(not(windows))]
-fn detect_gpu() -> Option<GpuInfo> {
-    None
+fn detect_gpu() -> (Option<GpuInfo>, Vec<GpuInfo>) {
+    (None, Vec::new())
 }
 
 fn log_gpu(gpu: Option<&GpuInfo>) {
@@ -491,8 +629,19 @@ pub fn gpu_blocking(refresh: bool) -> Option<GpuInfo> {
             return cached;
         }
     }
-    let detected = detect_gpu();
+    let (detected, rows) = detect_gpu();
     log_gpu(detected.as_ref());
+    if rows.len() > 1 {
+        for row in &rows {
+            tracing::info!(
+                "NVIDIA graphics card {}: compute capability {}, whisper CUDA kernels {}",
+                row.name,
+                row.compute_cap.as_deref().unwrap_or("unknown"),
+                if uncovered(row) { "not covered" } else { "covered or unknown" }
+            );
+        }
+    }
+    *NVIDIA_ROWS.lock() = rows;
     *GPU_CACHE.lock() = Some(detected.clone());
     detected
 }
@@ -566,15 +715,16 @@ fn derive_tier(ram_mb: u64, cores: u32, build_gpu: bool) -> HwTier {
 pub fn detect(card: Option<GpuInfo>, blocked: bool) -> HardwareInfo {
     let total_ram_mb = total_ram_mb();
     let logical_cores = logical_cores();
-    let gpu = whisper_gpu(card.as_ref(), blocked).allowed();
-    let tier = derive_tier(total_ram_mb, logical_cores, gpu);
+    let gate = whisper_gpu(card.as_ref(), blocked);
+    let tier = derive_tier(total_ram_mb, logical_cores, gate.allowed());
     HardwareInfo {
         total_ram_mb,
         logical_cores,
-        build_gpu: gpu,
+        build_gpu: gate.allowed(),
         os: std::env::consts::OS.to_string(),
         tier,
         gpu: card,
+        whisper_gpu: gate,
     }
 }
 
@@ -704,19 +854,19 @@ mod tests {
         let rtx5090_next = card(GpuVendor::Nvidia, Some("12.1"));
         let unknown = card(GpuVendor::Nvidia, None);
         let radeon = card(GpuVendor::Amd, None);
-        assert_eq!(whisper_gpu_for(true, false, Some(&rtx5070), false), WhisperGpu::Allowed);
-        assert_eq!(whisper_gpu_for(true, false, Some(&gtx1080), false), WhisperGpu::Allowed);
-        assert_eq!(whisper_gpu_for(true, false, Some(&unknown), false), WhisperGpu::Allowed);
-        assert_eq!(whisper_gpu_for(true, false, Some(&v100), false), WhisperGpu::Unsupported);
-        assert_eq!(whisper_gpu_for(true, false, Some(&rtx5090_next), false), WhisperGpu::Unsupported);
-        assert_eq!(whisper_gpu_for(true, false, Some(&radeon), false), WhisperGpu::NoNvidia);
-        assert_eq!(whisper_gpu_for(true, false, None, false), WhisperGpu::NoNvidia);
-        assert_eq!(whisper_gpu_for(true, false, Some(&rtx5070), true), WhisperGpu::Blocked);
-        assert_eq!(whisper_gpu_for(true, false, Some(&unknown), true), WhisperGpu::Blocked);
-        assert_eq!(whisper_gpu_for(true, false, Some(&v100), true), WhisperGpu::Unsupported);
-        assert_eq!(whisper_gpu_for(false, false, Some(&rtx5070), false), WhisperGpu::NotCompiled);
-        assert_eq!(whisper_gpu_for(false, true, None, false), WhisperGpu::Allowed);
-        assert_eq!(whisper_gpu_for(false, true, None, true), WhisperGpu::Allowed);
+        assert_eq!(whisper_gpu_for(true, false, Some(&rtx5070), &[], false), WhisperGpu::Allowed);
+        assert_eq!(whisper_gpu_for(true, false, Some(&gtx1080), &[], false), WhisperGpu::Allowed);
+        assert_eq!(whisper_gpu_for(true, false, Some(&unknown), &[], false), WhisperGpu::Allowed);
+        assert_eq!(whisper_gpu_for(true, false, Some(&v100), &[], false), WhisperGpu::Unsupported);
+        assert_eq!(whisper_gpu_for(true, false, Some(&rtx5090_next), &[], false), WhisperGpu::Unsupported);
+        assert_eq!(whisper_gpu_for(true, false, Some(&radeon), &[], false), WhisperGpu::NoNvidia);
+        assert_eq!(whisper_gpu_for(true, false, None, &[], false), WhisperGpu::NoNvidia);
+        assert_eq!(whisper_gpu_for(true, false, Some(&rtx5070), &[], true), WhisperGpu::Blocked);
+        assert_eq!(whisper_gpu_for(true, false, Some(&unknown), &[], true), WhisperGpu::Blocked);
+        assert_eq!(whisper_gpu_for(true, false, Some(&v100), &[], true), WhisperGpu::Unsupported);
+        assert_eq!(whisper_gpu_for(false, false, Some(&rtx5070), &[], false), WhisperGpu::NotCompiled);
+        assert_eq!(whisper_gpu_for(false, true, None, &[], false), WhisperGpu::Allowed);
+        assert_eq!(whisper_gpu_for(false, true, None, &[], true), WhisperGpu::Allowed);
         assert!(WhisperGpu::Allowed.allowed());
         for gate in [
             WhisperGpu::NotCompiled,
@@ -727,6 +877,124 @@ mod tests {
             assert!(!gate.allowed());
             assert!(!gate.reason().is_empty());
         }
+    }
+
+    #[test]
+    fn whisper_gpu_gate_requires_every_nvidia_card_to_be_covered() {
+        let primary = card(GpuVendor::Nvidia, Some("7.5"));
+        let covered = [card(GpuVendor::Nvidia, Some("7.5")), card(GpuVendor::Nvidia, Some("12.0"))];
+        let mixed = [card(GpuVendor::Nvidia, Some("7.5")), card(GpuVendor::Nvidia, Some("8.0"))];
+        let unknown_and_covered = [card(GpuVendor::Nvidia, Some("8.9")), card(GpuVendor::Nvidia, None)];
+        let unknown_and_uncovered = [card(GpuVendor::Nvidia, None), card(GpuVendor::Nvidia, Some("7.0"))];
+        assert_eq!(whisper_gpu_for(true, false, Some(&primary), &covered, false), WhisperGpu::Allowed);
+        assert_eq!(whisper_gpu_for(true, false, Some(&primary), &mixed, false), WhisperGpu::Unsupported);
+        assert_eq!(whisper_gpu_for(true, false, Some(&primary), &unknown_and_covered, false), WhisperGpu::Allowed);
+        assert_eq!(whisper_gpu_for(true, false, Some(&primary), &unknown_and_uncovered, false), WhisperGpu::Unsupported);
+        assert_eq!(whisper_gpu_for(true, false, Some(&primary), &mixed, true), WhisperGpu::Unsupported);
+        assert_eq!(whisper_gpu_for(true, false, Some(&primary), &covered, true), WhisperGpu::Blocked);
+        let radeon = card(GpuVendor::Amd, None);
+        assert_eq!(whisper_gpu_for(true, false, Some(&radeon), &mixed, false), WhisperGpu::NoNvidia);
+        assert_eq!(whisper_gpu_for(false, true, None, &mixed, false), WhisperGpu::Allowed);
+    }
+
+    #[test]
+    fn whisper_gpu_gate_serializes_as_snake_case() {
+        let pairs = [
+            (WhisperGpu::Allowed, "\"allowed\""),
+            (WhisperGpu::NotCompiled, "\"not_compiled\""),
+            (WhisperGpu::NoNvidia, "\"no_nvidia\""),
+            (WhisperGpu::Unsupported, "\"unsupported\""),
+            (WhisperGpu::Blocked, "\"blocked\""),
+        ];
+        for (gate, text) in pairs {
+            assert_eq!(serde_json::to_string(&gate).ok().as_deref(), Some(text));
+        }
+    }
+
+    #[test]
+    fn gpu_strikes_count_only_repeats_of_the_same_mark() {
+        let gpu = card(GpuVendor::Nvidia, Some("12.0"));
+        let mark = GpuMark::new(Some(&gpu), "1.0.3");
+        let other = GpuMark::new(Some(&gpu), "1.0.4");
+        let first = next_strikes(None, mark.clone());
+        assert_eq!(first.count, 1);
+        assert!(!strikes_block(&first));
+        let second = next_strikes(Some(first.clone()), mark.clone());
+        assert_eq!(second.count, 2);
+        assert!(strikes_block(&second));
+        let reset = next_strikes(Some(second), other.clone());
+        assert_eq!(reset, GpuStrikes { mark: other, count: 1 });
+        assert!(!strikes_block(&reset));
+        let saturated = next_strikes(Some(GpuStrikes { mark: mark.clone(), count: u32::MAX }), mark);
+        assert_eq!(saturated.count, u32::MAX);
+    }
+
+    fn guard_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("synapse-gpu-guard-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(std::fs::create_dir_all(&dir).is_ok());
+        dir
+    }
+
+    #[test]
+    fn crash_record_blocks_immediately_and_clears_the_rest() {
+        let dir = guard_dir("crash");
+        let gpu = card(GpuVendor::Nvidia, Some("12.0"));
+        let mark = GpuMark::new(Some(&gpu), "1.0.3");
+        assert!(write_mark(&dir.join(WHISPER_GPU_CRASHED), &mark));
+        assert!(write_mark(&dir.join(WHISPER_GPU_PENDING), &mark));
+        assert!(write_mark(&dir.join(WHISPER_GPU_STRIKES), &GpuStrikes { mark: mark.clone(), count: 1 }));
+        assert!(recover_whisper_marks(&dir));
+        assert_eq!(read_mark(&dir.join(WHISPER_GPU_BLOCKED)), MarkRead::Found(mark));
+        assert!(!dir.join(WHISPER_GPU_CRASHED).exists());
+        assert!(!dir.join(WHISPER_GPU_PENDING).exists());
+        assert!(!dir.join(WHISPER_GPU_STRIKES).exists());
+        assert!(!recover_whisper_marks(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn interrupted_steps_block_only_on_the_second_strike() {
+        let dir = guard_dir("strikes");
+        let gpu = card(GpuVendor::Nvidia, Some("12.0"));
+        let mark = GpuMark::new(Some(&gpu), "1.0.3");
+        let pending = dir.join(WHISPER_GPU_PENDING);
+        let strikes = dir.join(WHISPER_GPU_STRIKES);
+        let blocked = dir.join(WHISPER_GPU_BLOCKED);
+        assert!(!recover_whisper_marks(&dir));
+        assert!(write_mark(&pending, &mark));
+        assert!(!recover_whisper_marks(&dir));
+        assert!(!pending.exists());
+        assert!(!blocked.exists());
+        assert_eq!(read_json::<GpuStrikes>(&strikes), MarkRead::Found(GpuStrikes { mark: mark.clone(), count: 1 }));
+        let updated = GpuMark::new(Some(&gpu), "1.0.4");
+        assert!(write_mark(&pending, &updated));
+        assert!(!recover_whisper_marks(&dir));
+        assert_eq!(read_json::<GpuStrikes>(&strikes), MarkRead::Found(GpuStrikes { mark: updated.clone(), count: 1 }));
+        assert!(write_mark(&pending, &updated));
+        assert!(recover_whisper_marks(&dir));
+        assert_eq!(read_mark(&blocked), MarkRead::Found(updated));
+        assert!(!pending.exists());
+        assert!(!strikes.exists());
+        assert!(std::fs::write(&pending, b"{broken").is_ok());
+        assert!(!recover_whisper_marks(&dir));
+        assert!(!pending.exists());
+        assert!(!strikes.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_marks_are_removed_from_the_old_folder() {
+        let dir = guard_dir("legacy");
+        let gpu = card(GpuVendor::Nvidia, Some("12.0"));
+        let mark = GpuMark::new(Some(&gpu), "1.0.3");
+        assert!(write_mark(&dir.join(WHISPER_GPU_PENDING), &mark));
+        assert!(write_mark(&dir.join(WHISPER_GPU_BLOCKED), &mark));
+        remove_legacy_marks(&dir);
+        assert!(!dir.join(WHISPER_GPU_PENDING).exists());
+        assert!(!dir.join(WHISPER_GPU_BLOCKED).exists());
+        remove_legacy_marks(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -70,7 +70,11 @@
     s.llm_backend === "local" ? "local" : s.llm_backend === "groq" ? "groq" : "other",
   );
   const translateValue = $derived(s.translation_enabled ? s.translation_target : "");
-  const llamaReady = $derived(!!app.llama && app.llama.binary && app.llama.model_present);
+  const llamaReady = $derived(
+    app.localAi
+      ? app.localAi.installed && app.localAi.model_present
+      : !!app.llama && app.llama.binary && app.llama.model_present,
+  );
   const recommended = $derived(app.models.find((m) => m.info?.id === RECOMMENDED_LLM) ?? null);
   const progress = $derived(app.llamaProgress);
   const groqModels = $derived(app.groq?.models ?? []);
@@ -106,7 +110,7 @@
   const canRepair = $derived(
     !setupBusy &&
       !!app.localAi?.repairable &&
-      (localState === "failed" || (localState === "ready" && app.localAi?.device !== "gpu")),
+      (localState === "failed" || localState === "ready"),
   );
   const installError = $derived(
     !setupBusy && progress?.error ? app.localAi?.last_error || progress.error : "",
