@@ -202,7 +202,7 @@ if "%FALTA%"=="1" (
     echo Alguns itens faltaram. Se acabou de instalar, FECHE este terminal, abra um novo e rode setup.bat de novo para verificar.
 ) else (
     echo Tudo pronto. Feche e reabra o terminal para o PATH atualizar.
-    echo Build CPU:  scripts\windows\build-cpu.bat
+    echo Build:      scripts\windows\build.bat - requer CUDA Toolkit
     echo Modo dev:   scripts\windows\run-dev.bat
 )
 echo.

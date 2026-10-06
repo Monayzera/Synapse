@@ -115,8 +115,7 @@ jobs:
             echo
             echo "| File | For |"
             echo "|---|---|"
-            echo "| \`Synapse_${VERSION}_windows_x64_nvidia-setup.exe\` | Windows with an NVIDIA GPU |"
-            echo "| \`Synapse-CPU_${VERSION}_windows_x64-setup.exe\` | Any Windows PC |"
+            echo "| \`Synapse_${VERSION}_windows_x64-setup.exe\` | Any Windows PC (uses an NVIDIA GPU when available) |"
             echo "| \`Synapse_${VERSION}_macos_arm64.dmg\` | Mac with Apple Silicon |"
             echo
             echo "## First launch"
@@ -171,12 +170,7 @@ jobs:
             os: windows-2022
             timeout: 300
             args: '--features cuda --bundles nsis'
-            asset: 'Synapse_[version]_windows_x64_nvidia[setup][ext]'
-          - variant: windows-cpu
-            os: windows-2022
-            timeout: 120
-            args: '--config src-tauri/tauri.cpu.conf.json --bundles nsis -- --no-default-features --features vad'
-            asset: 'Synapse-CPU_[version]_windows_x64[setup][ext]'
+            asset: 'Synapse_[version]_windows_x64[setup][ext]'
           - variant: macos-arm64
             os: macos-15
             timeout: 120
@@ -220,9 +214,6 @@ jobs:
             $vars.CMAKE_GENERATOR = 'Ninja'
             $vars.CMAKE_CUDA_ARCHITECTURES = '61-real;75-real;86-real;89-real;120a-real'
             $vars.GGML_CUDA_FA = 'OFF'
-          } else {
-            $vars.CFLAGS = '/arch:AVX2'
-            $vars.CXXFLAGS = '/arch:AVX2'
           }
           foreach ($k in $vars.Keys) { Add-Content -Path $env:GITHUB_ENV -Value "$k=$($vars[$k])" -Encoding utf8 }
 
@@ -318,16 +309,14 @@ jobs:
       - name: Fetch GPU native dependencies
         if: matrix.variant == 'windows-gpu'
         shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./scripts/windows/fetch-deps.ps1
 
       - name: Verify GPU resources
         if: matrix.variant == 'windows-gpu'
         shell: pwsh
         run: |
+          if (Test-Path 'src-tauri\resources\binaries') { throw 'src-tauri\resources\binaries must not be bundled' }
           $required = @(
-            'src-tauri\resources\binaries\llama-server.exe',
             'src-tauri\resources\cuda\cudart64_12.dll',
             'src-tauri\resources\cuda\cublas64_12.dll',
             'src-tauri\resources\cuda\cublasLt64_12.dll'
@@ -457,10 +446,9 @@ jobs:
           fi
           work="${RUNNER_TEMP}/publish"
           mkdir -p "${work}"
-          nvidia="Synapse_${V}_windows_x64_nvidia-setup.exe"
-          cpu="Synapse-CPU_${V}_windows_x64-setup.exe"
+          windows="Synapse_${V}_windows_x64-setup.exe"
           mac="Synapse_${V}_macos_arm64.app.tar.gz"
-          updaters=("${nvidia}" "${cpu}" "${mac}")
+          updaters=("${windows}" "${mac}")
           expected=("Synapse_${V}_macos_arm64.dmg")
           for f in "${updaters[@]}"; do expected+=("${f}" "${f}.sig"); done
           gh api --paginate "repos/${R}/releases/${ID}/assets?per_page=100" --jq '.[] | [.id, .name, .state, .size] | @tsv' > "${work}/assets.tsv"
@@ -503,15 +491,15 @@ jobs:
             --arg version "${V}" \
             --arg notes "https://github.com/${R}/releases/tag/${TAG}" \
             --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --arg nvidia_url "${base}/${nvidia}" --rawfile nvidia_sig "${work}/${nvidia}.sig" \
-            --arg cpu_url "${base}/${cpu}" --rawfile cpu_sig "${work}/${cpu}.sig" \
+            --arg win_url "${base}/${windows}" --rawfile win_sig "${work}/${windows}.sig" \
             --arg mac_url "${base}/${mac}" --rawfile mac_sig "${work}/${mac}.sig" \
             '{version: $version, notes: $notes, pub_date: $date, platforms: {
-              "windows-x86_64-nvidia": {signature: ($nvidia_sig | rtrimstr("\n")), url: $nvidia_url},
-              "windows-x86_64-cpu": {signature: ($cpu_sig | rtrimstr("\n")), url: $cpu_url},
+              "windows-x86_64": {signature: ($win_sig | rtrimstr("\n")), url: $win_url},
+              "windows-x86_64-nvidia": {signature: ($win_sig | rtrimstr("\n")), url: $win_url},
+              "windows-x86_64-cpu": {signature: ($win_sig | rtrimstr("\n")), url: $win_url},
               "darwin-aarch64": {signature: ($mac_sig | rtrimstr("\n")), url: $mac_url}
             }}' > "${work}/latest.json"
-          jq -e --arg v "${V}" '.version == $v and (.platforms | length) == 3 and ([.platforms[] | ((.signature | length) > 0) and (.url | startswith("https://github.com/"))] | all)' "${work}/latest.json" > /dev/null
+          jq -e --arg v "${V}" '.version == $v and (.platforms | length) == 4 and ([.platforms[] | ((.signature | length) > 0) and (.url | startswith("https://github.com/"))] | all)' "${work}/latest.json" > /dev/null
           cat "${work}/latest.json"
           curl -fsS -X POST \
             -H "Authorization: Bearer ${GH_TOKEN}" \

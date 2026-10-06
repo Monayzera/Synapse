@@ -1,4 +1,5 @@
 use crate::error::{AppError, AppResult};
+use crate::hardware::GpuMark;
 use crate::pipeline::CANCEL;
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -8,6 +9,28 @@ pub struct TranscribeEngine {
     context: WhisperContext,
     pub on_gpu: bool,
     pub backend: String,
+    pub gpu_check: parking_lot::Mutex<Option<GpuMark>>,
+}
+
+extern "C" fn log_ggml_abort(message: *const std::os::raw::c_char) {
+    let text = if message.is_null() {
+        "no reason given".to_string()
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(message) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    tracing::error!("whisper engine aborted the process: {text}");
+}
+
+fn install_abort_logger() {
+    static ABORT_LOGGER: std::sync::Once = std::sync::Once::new();
+    ABORT_LOGGER.call_once(|| {
+        let callback: unsafe extern "C" fn(*const std::os::raw::c_char) = log_ggml_abort;
+        unsafe {
+            whisper_rs::whisper_rs_sys::ggml_set_abort_callback(Some(callback));
+        }
+    });
 }
 
 fn gpu_device_name() -> Option<String> {
@@ -44,6 +67,9 @@ impl TranscribeEngine {
         SYSINFO_ONCE.call_once(|| {
             tracing::info!("whisper system_info: {}", whisper_rs::print_system_info());
         });
+        if crate::hardware::whisper_gpu_guarded() {
+            install_abort_logger();
+        }
         match model_path.try_exists() {
             Ok(true) => {}
             Ok(false) => {
@@ -70,6 +96,7 @@ impl TranscribeEngine {
                             context,
                             on_gpu: true,
                             backend: format!("GPU ({device})"),
+                            gpu_check: parking_lot::Mutex::new(None),
                         },
                         None => {
                             tracing::warn!(
@@ -79,6 +106,7 @@ impl TranscribeEngine {
                                 context,
                                 on_gpu: false,
                                 backend: "CPU".to_string(),
+                                gpu_check: parking_lot::Mutex::new(None),
                             }
                         }
                     });
@@ -94,6 +122,7 @@ impl TranscribeEngine {
             context,
             on_gpu: false,
             backend: "CPU".to_string(),
+            gpu_check: parking_lot::Mutex::new(None),
         })
     }
 

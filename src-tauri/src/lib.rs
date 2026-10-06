@@ -48,6 +48,8 @@ use tauri::{Emitter, Manager, WindowEvent};
 use tauri_plugin_autostart::MacosLauncher;
 
 const DATA_ROOT_POINTER: &str = "data_root";
+#[cfg(windows)]
+const LEGACY_CPU_IDENTIFIER: &str = "com.synapse.voice.cpu";
 const DATA_ROOT_WAIT: Duration = Duration::from_secs(60);
 const POINTER_READS: u32 = 5;
 const POINTER_RETRY: Duration = Duration::from_millis(200);
@@ -299,6 +301,8 @@ fn setup(app: &mut tauri::App, autostart_launch: bool, log_dir: PathBuf) {
         engine_lock: Mutex::new(()),
         engine_gen: AtomicU64::new(0),
         engine_settled: AtomicBool::new(false),
+        whisper_guard: Mutex::new(0),
+        whisper_gpu_recovered: AtomicBool::new(false),
         vad: RwLock::new(None),
         llm: LlmClient::new(),
         llm_state: AtomicU8::new(LlmState::Off.as_u8()),
@@ -321,6 +325,8 @@ fn setup(app: &mut tauri::App, autostart_launch: bool, log_dir: PathBuf) {
     });
 
     app.manage(state.clone());
+
+    state.recover_whisper_guard();
 
     permissions::init(&state);
 
@@ -682,6 +688,12 @@ fn resolve_base_dir(handle: &tauri::AppHandle) -> PathBuf {
         }
         Some(Pointer::Unreadable) | None => candidate_base_dir(handle).0,
         Some(Pointer::Missing) => {
+            #[cfg(windows)]
+            if let Some(pointer) = pointer.as_deref() {
+                if let Some(root) = adopt_legacy_root(pointer, LEGACY_CPU_IDENTIFIER) {
+                    return root;
+                }
+            }
             #[cfg(target_os = "macos")]
             if let Some(pointer) = pointer.as_deref() {
                 if let Some(root) = adopt_fallback_root(handle, pointer) {
@@ -699,6 +711,38 @@ fn resolve_base_dir(handle: &tauri::AppHandle) -> PathBuf {
             chosen
         }
     }
+}
+
+#[cfg(any(windows, test))]
+fn legacy_pointer(own: &Path, legacy_identifier: &str) -> Option<PathBuf> {
+    let legacy = own
+        .parent()?
+        .parent()?
+        .join(legacy_identifier)
+        .join(DATA_ROOT_POINTER);
+    (legacy != own).then_some(legacy)
+}
+
+#[cfg(any(windows, test))]
+fn adopt_legacy_root(own: &Path, legacy_identifier: &str) -> Option<PathBuf> {
+    let legacy = legacy_pointer(own, legacy_identifier)?;
+    let Pointer::Found(dir) = read_pointer_patiently(&legacy) else {
+        return None;
+    };
+    if !dir.is_absolute() || !is_dir(&dir) {
+        tracing::info!(
+            "data root {} from {} is not usable; not adopted",
+            dir.display(),
+            legacy.display()
+        );
+        return None;
+    }
+    let text = dir.to_string_lossy().to_string();
+    match crate::atomic_io::write_durable(own, text.as_bytes()) {
+        Ok(()) => tracing::info!("data root {} adopted from {}", dir.display(), legacy.display()),
+        Err(err) => tracing::warn!("adopted data root {} not remembered: {err}", dir.display()),
+    }
+    Some(dir)
 }
 
 fn preferred_base_dir(handle: &tauri::AppHandle) -> Option<PathBuf> {
@@ -1028,10 +1072,8 @@ fn prepend_dll_dirs(resource_dir: &Path) {
         resource_dir.to_path_buf(),
         resource_dir.join("resources"),
         resource_dir.join("resources").join("cuda"),
-        resource_dir.join("resources").join("binaries"),
         manifest.join("resources"),
         manifest.join("resources").join("cuda"),
-        manifest.join("resources").join("binaries"),
     ];
     let existing: Vec<PathBuf> = candidates.into_iter().filter(|p| p.exists()).collect();
     if existing.is_empty() {
@@ -1290,5 +1332,37 @@ fn instance_guard(identifier: &str) -> InstanceGuard {
             };
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_cpu_data_root_is_adopted_only_when_usable() {
+        let base = std::env::temp_dir().join(format!("synapse-adopt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let own = base.join("com.synapse.voice").join(DATA_ROOT_POINTER);
+        let legacy_dir = base.join("com.synapse.voice.cpu");
+        let legacy = legacy_dir.join(DATA_ROOT_POINTER);
+        let root = base.join("Documents").join("Synapse");
+        assert_eq!(legacy_pointer(&own, "com.synapse.voice.cpu"), Some(legacy.clone()));
+        assert_eq!(legacy_pointer(&own, "com.synapse.voice"), None);
+        assert_eq!(adopt_legacy_root(&own, "com.synapse.voice.cpu"), None);
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(&legacy, root.to_string_lossy().as_bytes()).unwrap();
+        assert_eq!(adopt_legacy_root(&own, "com.synapse.voice.cpu"), None);
+        assert!(!own.exists());
+        std::fs::write(&legacy, b"relative-dir").unwrap();
+        assert_eq!(adopt_legacy_root(&own, "com.synapse.voice.cpu"), None);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&legacy, format!("  {}  \n", root.display())).unwrap();
+        assert_eq!(adopt_legacy_root(&own, "com.synapse.voice.cpu"), Some(root.clone()));
+        assert_eq!(
+            std::fs::read_to_string(&own).unwrap(),
+            root.to_string_lossy().to_string()
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

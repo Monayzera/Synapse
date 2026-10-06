@@ -12,7 +12,6 @@
 *.log
 
 # fetched native deps (run scripts/windows/fetch-deps.ps1) - too large for git
-/src-tauri/resources/binaries/
 /src-tauri/resources/cuda/
 /src-tauri/resources/onnxruntime*.dll
 

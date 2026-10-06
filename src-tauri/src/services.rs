@@ -7,7 +7,7 @@ use crate::{autostart, hotkey};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 const ENGINE_RETRIES: u32 = 5;
 const ENGINE_RETRY_MAX: Duration = Duration::from_secs(30);
@@ -671,6 +671,47 @@ fn spawn_unreadable_notice(state: SharedState) {
     });
 }
 
+pub fn spawn_whisper_gpu_notice(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        for _ in 0..80 {
+            let ready = app
+                .try_state::<SharedState>()
+                .is_some_and(|state| state.widget_ready.load(Ordering::Acquire));
+            if ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        crate::pipeline::emit_info(
+            &app,
+            "transcription",
+            crate::state::WHISPER_GPU_DISABLED,
+            "The graphics card crashed Whisper; using the processor.",
+        );
+    });
+}
+
+fn adopt_legacy_autostart(state: &SharedState, enabled: bool) -> bool {
+    if !autostart::remove_legacy_cpu_entry() || enabled {
+        return enabled;
+    }
+    let changed = state.mutate_settings(|settings| {
+        settings.autostart = true;
+        Ok(())
+    });
+    match changed {
+        Ok(_) => {
+            tracing::info!("autostart carried over from Synapse CPU");
+            state.emit_settings_changed();
+            true
+        }
+        Err(err) => {
+            tracing::warn!("autostart could not be carried over from Synapse CPU: {err}");
+            enabled
+        }
+    }
+}
+
 pub fn bootstrap(app: &AppHandle, state: &SharedState, migrated: bool) {
     if let Err(err) = hotkey::apply(app, state) {
         tracing::warn!("hotkey bootstrap: {err}");
@@ -698,7 +739,8 @@ pub fn bootstrap(app: &AppHandle, state: &SharedState, migrated: bool) {
         spawn_settings_recovery(app.clone(), state.clone());
         spawn_unreadable_notice(state.clone());
     } else {
-        autostart::reconcile(app, settings.autostart);
+        let desired = adopt_legacy_autostart(state, settings.autostart);
+        autostart::reconcile(app, desired);
     }
 
     if migrated {

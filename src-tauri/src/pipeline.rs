@@ -44,6 +44,10 @@ pub fn emit_error(app: &AppHandle, stage: &str, code: &str, message: &str) {
     emit_event(app, stage, code, message, json!({}), "error");
 }
 
+pub fn emit_info(app: &AppHandle, stage: &str, code: &str, message: &str) {
+    emit_event(app, stage, code, message, json!({}), "info");
+}
+
 fn emit_issue(app: &AppHandle, stage: &str, issue: Issue) {
     emit_event(app, stage, issue.code, &issue.message, issue.params, "error");
 }

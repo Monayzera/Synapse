@@ -7,10 +7,11 @@ to source control.
 Expected contents after `fetch-deps`:
 
 - `silero_vad.onnx` — Silero VAD model used to trim silence.
-- `binaries/llama-server.exe` — llama.cpp OpenAI-compatible server (CUDA build).
-- `binaries/*.dll` — runtime DLLs required by `llama-server.exe`.
 - `cuda/*.dll` — CUDA runtime DLLs (`cudart`, `cublas`, `cublasLt`) for the
   Whisper GPU path on machines without the full CUDA Toolkit installed.
+
+The local AI server (`llama-server`) is not bundled. The app downloads the build that
+matches the graphics card into the per-user data folder on first use.
 
 Speech and LLM model weights (`ggml-*.bin`, `*.gguf`) are downloaded on first run
 into the per-user app data folder, not bundled here.

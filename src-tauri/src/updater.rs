@@ -41,6 +41,8 @@ const STATUS_EVENT: &str = "update-status";
 const NOTICE_EVENT: &str = "update-notice";
 const MARKER_FILE: &str = "update-state.json";
 const CACHE_DIR: &str = "updates";
+#[cfg(any(windows, test))]
+const LEGACY_APP_NAME: &str = "Synapse CPU";
 const CACHE_PREFIX: &str = "synapse-";
 const CACHE_EXT: &str = "bin";
 const PART_EXT: &str = "part";
@@ -236,8 +238,7 @@ pub fn init(app: &AppHandle) {
         tracing::info!("auto-update is off in this build");
         return;
     }
-    let identifier = app.config().identifier.clone();
-    let Some(target) = target_key(std::env::consts::OS, &identifier) else {
+    let Some(target) = target_key(std::env::consts::OS) else {
         tracing::info!("auto-update is not available on {}", std::env::consts::OS);
         return;
     };
@@ -1379,7 +1380,11 @@ impl AutoUpdater {
                 prune_cache(&dir, &keep);
             }
             #[cfg(windows)]
-            remove_installer_leftovers(&std::env::temp_dir(), &app_name);
+            {
+                let temp = std::env::temp_dir();
+                remove_installer_leftovers(&temp, &app_name);
+                remove_installer_leftovers(&temp, LEGACY_APP_NAME);
+            }
         })
         .await;
         if let Err(err) = result {
@@ -1394,10 +1399,9 @@ fn build_supported() -> bool {
             || cfg!(all(target_os = "macos", target_arch = "aarch64")))
 }
 
-fn target_key(os: &str, identifier: &str) -> Option<&'static str> {
+fn target_key(os: &str) -> Option<&'static str> {
     match os {
-        "windows" if identifier.ends_with(".cpu") => Some("windows-x86_64-cpu"),
-        "windows" => Some("windows-x86_64-nvidia"),
+        "windows" => Some("windows-x86_64"),
         "macos" => Some("darwin-aarch64"),
         _ => None,
     }
@@ -2071,23 +2075,21 @@ mod tests {
     }
 
     #[test]
-    fn each_variant_has_its_own_target() {
+    fn every_install_uses_the_unified_platform_target() {
         let main = app_config();
-        let cpu: serde_json::Value =
-            serde_json::from_str(include_str!("../tauri.cpu.conf.json")).unwrap();
+        assert_eq!(main["identifier"].as_str(), Some("com.synapse.voice"));
+        assert_eq!(main["productName"].as_str(), Some("Synapse"));
+        assert_eq!(target_key("windows"), Some("windows-x86_64"));
+        assert_eq!(target_key("macos"), Some("darwin-aarch64"));
+        assert_eq!(target_key("linux"), None);
         assert_eq!(
-            target_key("windows", main["identifier"].as_str().unwrap()),
-            Some("windows-x86_64-nvidia")
+            main["bundle"]["windows"]["nsis"]["installerHooks"].as_str(),
+            Some("./windows/hooks.nsh")
         );
-        assert_eq!(
-            target_key("windows", cpu["identifier"].as_str().unwrap()),
-            Some("windows-x86_64-cpu")
-        );
-        assert_eq!(
-            target_key("macos", main["identifier"].as_str().unwrap()),
-            Some("darwin-aarch64")
-        );
-        assert_eq!(target_key("linux", "com.synapse.voice"), None);
+        let hooks = include_str!("../windows/hooks.nsh");
+        assert!(hooks.contains("!macro NSIS_HOOK_PREINSTALL"));
+        assert!(hooks.contains("!macro NSIS_HOOK_POSTINSTALL"));
+        assert!(hooks.contains(LEGACY_APP_NAME));
     }
 
     #[test]
@@ -2264,6 +2266,8 @@ mod tests {
         assert!(!is_installer_leftover("Other-1.0.2-updater-abc", "Synapse"));
         assert!(!is_installer_leftover("Synapse-1.0.2-installer.exe", "Synapse"));
         assert!(!is_installer_leftover("Synapse-1.0.2-updater-ab.cd", "Synapse"));
+        assert!(is_installer_leftover("Synapse CPU-1.0.3-updater-Qw12Er", LEGACY_APP_NAME));
+        assert!(!is_installer_leftover("Synapse-1.0.3-updater-Qw12Er", LEGACY_APP_NAME));
     }
 
     #[test]

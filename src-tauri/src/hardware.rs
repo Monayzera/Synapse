@@ -1,5 +1,11 @@
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
+use tauri::Manager;
+
+pub const WHISPER_GPU_PENDING: &str = "whisper_gpu.pending";
+pub const WHISPER_GPU_BLOCKED: &str = "whisper_gpu.blocked";
+const MARK_REMOVE_ATTEMPTS: u32 = 5;
 
 #[cfg(windows)]
 const VENDOR_NVIDIA: u32 = 0x10DE;
@@ -97,6 +103,144 @@ fn arch_covers(archs: &[CudaArch], cc: (u32, u32)) -> bool {
 
 pub fn whisper_cuda_supported(cc: (u32, u32)) -> bool {
     arch_covers(&WHISPER_CUDA_ARCHS, cc)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhisperGpu {
+    Allowed,
+    NotCompiled,
+    NoNvidia,
+    Unsupported,
+    Blocked,
+}
+
+impl WhisperGpu {
+    pub fn allowed(self) -> bool {
+        self == WhisperGpu::Allowed
+    }
+
+    pub fn reason(self) -> &'static str {
+        match self {
+            WhisperGpu::Allowed => "the graphics card can run whisper",
+            WhisperGpu::NotCompiled => "this build has no GPU support for whisper",
+            WhisperGpu::NoNvidia => "no NVIDIA graphics card was found",
+            WhisperGpu::Unsupported => {
+                "the NVIDIA graphics card's compute capability is not covered by the bundled whisper GPU kernels"
+            }
+            WhisperGpu::Blocked => {
+                "the graphics card crashed whisper before; the GPU stays off until the app or the graphics driver changes"
+            }
+        }
+    }
+}
+
+fn whisper_gpu_for(cuda: bool, metal: bool, gpu: Option<&GpuInfo>, blocked: bool) -> WhisperGpu {
+    if metal {
+        return WhisperGpu::Allowed;
+    }
+    if !cuda {
+        return WhisperGpu::NotCompiled;
+    }
+    let Some(gpu) = gpu.filter(|gpu| gpu.vendor == GpuVendor::Nvidia) else {
+        return WhisperGpu::NoNvidia;
+    };
+    if gpu.cc().is_some_and(|cc| !whisper_cuda_supported(cc)) {
+        return WhisperGpu::Unsupported;
+    }
+    if blocked {
+        return WhisperGpu::Blocked;
+    }
+    WhisperGpu::Allowed
+}
+
+pub fn whisper_gpu(gpu: Option<&GpuInfo>, blocked: bool) -> WhisperGpu {
+    whisper_gpu_for(cfg!(feature = "cuda"), cfg!(feature = "metal"), gpu, blocked)
+}
+
+pub fn whisper_gpu_guarded() -> bool {
+    cfg!(feature = "cuda") && !cfg!(feature = "metal")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuMark {
+    pub gpu: String,
+    pub version: String,
+}
+
+impl GpuMark {
+    pub fn new(gpu: Option<&GpuInfo>, version: &str) -> GpuMark {
+        GpuMark {
+            gpu: gpu.map(GpuInfo::fingerprint).unwrap_or_default(),
+            version: version.trim().to_string(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum MarkRead {
+    Missing,
+    Found(GpuMark),
+    Invalid,
+}
+
+pub fn read_mark(path: &Path) -> MarkRead {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return MarkRead::Missing,
+        Err(err) => {
+            tracing::warn!("{} could not be read: {err}", path.display());
+            return MarkRead::Invalid;
+        }
+    };
+    match serde_json::from_str::<GpuMark>(&text) {
+        Ok(mark) => MarkRead::Found(mark),
+        Err(err) => {
+            tracing::warn!("{} holds invalid data: {err}", path.display());
+            MarkRead::Invalid
+        }
+    }
+}
+
+pub fn write_mark(path: &Path, mark: &GpuMark) -> bool {
+    let bytes = match serde_json::to_vec(mark) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!("{} could not be encoded: {err}", path.display());
+            return false;
+        }
+    };
+    match crate::atomic_io::write_durable(path, &bytes) {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!("{} could not be written: {err}", path.display());
+            false
+        }
+    }
+}
+
+pub fn remove_mark(path: &Path) -> bool {
+    let mut attempt: u32 = 1;
+    loop {
+        match std::fs::remove_file(path) {
+            Ok(()) => return true,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(err) if attempt >= MARK_REMOVE_ATTEMPTS => {
+                tracing::warn!("{} could not be removed: {err}", path.display());
+                return false;
+            }
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(40 * u64::from(attempt)));
+                attempt += 1;
+            }
+        }
+    }
+}
+
+pub fn mark_matches(mark: &MarkRead, gpu: Option<&GpuInfo>, version: &str) -> bool {
+    match mark {
+        MarkRead::Found(mark) => *mark == GpuMark::new(gpu, version),
+        MarkRead::Missing | MarkRead::Invalid => false,
+    }
 }
 
 pub fn parse_compute_cap(text: &str) -> Option<(u32, u32)> {
@@ -340,7 +484,7 @@ pub fn cached_gpu() -> Option<GpuInfo> {
     GPU_CACHE.lock().clone().flatten()
 }
 
-fn gpu_blocking(refresh: bool) -> Option<GpuInfo> {
+pub fn gpu_blocking(refresh: bool) -> Option<GpuInfo> {
     let _serial = GPU_DETECT.lock();
     if !refresh {
         if let Some(cached) = GPU_CACHE.lock().clone() {
@@ -367,10 +511,6 @@ fn logical_cores() -> u32 {
     std::thread::available_parallelism()
         .map(|n| n.get() as u32)
         .unwrap_or(4)
-}
-
-fn build_gpu() -> bool {
-    cfg!(feature = "cuda") || cfg!(feature = "metal")
 }
 
 #[cfg(windows)]
@@ -423,10 +563,10 @@ fn derive_tier(ram_mb: u64, cores: u32, build_gpu: bool) -> HwTier {
     }
 }
 
-pub fn detect(card: Option<GpuInfo>) -> HardwareInfo {
+pub fn detect(card: Option<GpuInfo>, blocked: bool) -> HardwareInfo {
     let total_ram_mb = total_ram_mb();
     let logical_cores = logical_cores();
-    let gpu = build_gpu();
+    let gpu = whisper_gpu(card.as_ref(), blocked).allowed();
     let tier = derive_tier(total_ram_mb, logical_cores, gpu);
     HardwareInfo {
         total_ram_mb,
@@ -438,13 +578,27 @@ pub fn detect(card: Option<GpuInfo>) -> HardwareInfo {
     }
 }
 
+fn whisper_gpu_blocked(app: &tauri::AppHandle, card: Option<&GpuInfo>) -> bool {
+    app.try_state::<crate::state::SharedState>()
+        .is_some_and(|state| state.whisper_gpu_blocked(card))
+}
+
 #[tauri::command]
-pub async fn hardware_info() -> HardwareInfo {
-    match tokio::task::spawn_blocking(|| detect(gpu_blocking(false))).await {
+pub async fn hardware_info(app: tauri::AppHandle) -> HardwareInfo {
+    let worker = app.clone();
+    let probe = tokio::task::spawn_blocking(move || {
+        let card = gpu_blocking(false);
+        let blocked = whisper_gpu_blocked(&worker, card.as_ref());
+        detect(card, blocked)
+    })
+    .await;
+    match probe {
         Ok(info) => info,
         Err(err) => {
             tracing::warn!("hardware detection failed: {err}");
-            detect(cached_gpu())
+            let card = cached_gpu();
+            let blocked = whisper_gpu_blocked(&app, card.as_ref());
+            detect(card, blocked)
         }
     }
 }
@@ -531,6 +685,76 @@ mod tests {
         ] {
             assert!(!whisper_cuda_supported(cc), "{cc:?} should not be covered");
         }
+    }
+
+    fn card(vendor: GpuVendor, cc: Option<&str>) -> GpuInfo {
+        GpuInfo {
+            vendor,
+            name: "Test Card".to_string(),
+            compute_cap: cc.map(str::to_string),
+            driver_version: Some("610.88".to_string()),
+        }
+    }
+
+    #[test]
+    fn whisper_gpu_gate_follows_build_card_and_block() {
+        let rtx5070 = card(GpuVendor::Nvidia, Some("12.0"));
+        let gtx1080 = card(GpuVendor::Nvidia, Some("6.1"));
+        let v100 = card(GpuVendor::Nvidia, Some("7.0"));
+        let rtx5090_next = card(GpuVendor::Nvidia, Some("12.1"));
+        let unknown = card(GpuVendor::Nvidia, None);
+        let radeon = card(GpuVendor::Amd, None);
+        assert_eq!(whisper_gpu_for(true, false, Some(&rtx5070), false), WhisperGpu::Allowed);
+        assert_eq!(whisper_gpu_for(true, false, Some(&gtx1080), false), WhisperGpu::Allowed);
+        assert_eq!(whisper_gpu_for(true, false, Some(&unknown), false), WhisperGpu::Allowed);
+        assert_eq!(whisper_gpu_for(true, false, Some(&v100), false), WhisperGpu::Unsupported);
+        assert_eq!(whisper_gpu_for(true, false, Some(&rtx5090_next), false), WhisperGpu::Unsupported);
+        assert_eq!(whisper_gpu_for(true, false, Some(&radeon), false), WhisperGpu::NoNvidia);
+        assert_eq!(whisper_gpu_for(true, false, None, false), WhisperGpu::NoNvidia);
+        assert_eq!(whisper_gpu_for(true, false, Some(&rtx5070), true), WhisperGpu::Blocked);
+        assert_eq!(whisper_gpu_for(true, false, Some(&unknown), true), WhisperGpu::Blocked);
+        assert_eq!(whisper_gpu_for(true, false, Some(&v100), true), WhisperGpu::Unsupported);
+        assert_eq!(whisper_gpu_for(false, false, Some(&rtx5070), false), WhisperGpu::NotCompiled);
+        assert_eq!(whisper_gpu_for(false, true, None, false), WhisperGpu::Allowed);
+        assert_eq!(whisper_gpu_for(false, true, None, true), WhisperGpu::Allowed);
+        assert!(WhisperGpu::Allowed.allowed());
+        for gate in [
+            WhisperGpu::NotCompiled,
+            WhisperGpu::NoNvidia,
+            WhisperGpu::Unsupported,
+            WhisperGpu::Blocked,
+        ] {
+            assert!(!gate.allowed());
+            assert!(!gate.reason().is_empty());
+        }
+    }
+
+    #[test]
+    fn gpu_marks_roundtrip_and_match_only_the_same_card_and_version() {
+        let dir = std::env::temp_dir().join(format!("synapse-gpu-mark-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join(WHISPER_GPU_BLOCKED);
+        assert_eq!(read_mark(&path), MarkRead::Missing);
+        assert!(remove_mark(&path));
+        let gpu = card(GpuVendor::Nvidia, Some("12.0"));
+        let mark = GpuMark::new(Some(&gpu), " 1.0.3 ");
+        assert_eq!(mark.version, "1.0.3");
+        assert!(write_mark(&path, &mark));
+        let read = read_mark(&path);
+        assert_eq!(read, MarkRead::Found(mark.clone()));
+        assert!(mark_matches(&read, Some(&gpu), "1.0.3"));
+        assert!(!mark_matches(&read, Some(&gpu), "1.0.4"));
+        let mut updated = gpu.clone();
+        updated.driver_version = Some("612.01".to_string());
+        assert!(!mark_matches(&read, Some(&updated), "1.0.3"));
+        assert!(!mark_matches(&read, None, "1.0.3"));
+        assert!(!mark_matches(&MarkRead::Missing, Some(&gpu), "1.0.3"));
+        assert!(!mark_matches(&MarkRead::Invalid, Some(&gpu), "1.0.3"));
+        assert!(std::fs::write(&path, b"{not json").is_ok());
+        assert_eq!(read_mark(&path), MarkRead::Invalid);
+        assert!(remove_mark(&path));
+        assert_eq!(read_mark(&path), MarkRead::Missing);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

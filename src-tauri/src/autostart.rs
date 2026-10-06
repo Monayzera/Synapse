@@ -3,6 +3,7 @@ use serde::Serialize;
 use tauri::AppHandle;
 
 pub const AUTOSTART_ARG: &str = "--autostart";
+const LEGACY_CPU_NAME: &str = "Synapse CPU";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AutostartStatus {
@@ -53,6 +54,34 @@ pub fn status(app: &AppHandle) -> AutostartStatus {
         status.error = last_error();
     }
     status
+}
+
+pub fn remove_legacy_cpu_entry() -> bool {
+    match platform::remove_stale_entry(LEGACY_CPU_NAME) {
+        Ok(removed) => removed,
+        Err(err) => {
+            tracing::warn!("autostart entry {LEGACY_CPU_NAME} could not be checked: {err}");
+            false
+        }
+    }
+}
+
+#[cfg(windows)]
+fn command_exe(command: &str) -> Option<std::path::PathBuf> {
+    let command = command.trim();
+    let raw = match command.strip_prefix('"') {
+        Some(rest) => rest.split_once('"')?.0,
+        None => {
+            let end = command.to_ascii_lowercase().find(".exe")?;
+            &command[..end + 4]
+        }
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let path = std::path::PathBuf::from(raw);
+    path.is_absolute().then_some(path)
 }
 
 #[cfg(windows)]
@@ -316,6 +345,54 @@ mod platform {
         Ok(())
     }
 
+    pub fn remove_stale_entry(name: &str) -> Result<bool, String> {
+        if debug_build() {
+            return Ok(false);
+        }
+        let key = match open(RUN_KEY, KEY_READ | KEY_SET_VALUE)? {
+            Some(key) => key,
+            None => return Ok(false),
+        };
+        let command = match read(&key, name)? {
+            Some((kind, data)) if kind == REG_SZ => decode_string(&data),
+            Some(_) => {
+                tracing::info!("autostart entry {name} is not a plain command; left untouched");
+                return Ok(false);
+            }
+            None => return Ok(false),
+        };
+        let Some(exe) = super::command_exe(&command) else {
+            tracing::info!("autostart entry {name} has no readable program path; left untouched");
+            return Ok(false);
+        };
+        match exe.try_exists() {
+            Ok(false) => {}
+            Ok(true) => return Ok(false),
+            Err(err) => {
+                tracing::info!(
+                    "autostart entry {name} points to {} which could not be checked ({err}); left untouched",
+                    exe.display()
+                );
+                return Ok(false);
+            }
+        }
+        delete(&key, name)?;
+        match open(APPROVED_KEY, KEY_SET_VALUE) {
+            Ok(Some(approved)) => {
+                if let Err(err) = delete(&approved, name) {
+                    tracing::warn!("startup approval for {name} not removed: {err}");
+                }
+            }
+            Ok(None) => {}
+            Err(err) => tracing::warn!("startup approvals not opened: {err}"),
+        }
+        tracing::info!(
+            "stale autostart entry {name} removed (its program {} no longer exists)",
+            exe.display()
+        );
+        Ok(true)
+    }
+
     pub fn status(app: &AppHandle) -> AutostartStatus {
         let mut error = None;
         let enabled = match current_command(app) {
@@ -387,6 +464,10 @@ mod platform {
         })
     }
 
+    pub fn remove_stale_entry(_name: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+
     pub fn status(app: &AppHandle) -> AutostartStatus {
         match with_manager(app, |manager| manager.is_enabled().map_err(|e| e.to_string())) {
             Ok(enabled) => AutostartStatus {
@@ -416,11 +497,42 @@ mod platform {
         Err("autostart is not supported on this platform".to_string())
     }
 
+    pub fn remove_stale_entry(_name: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+
     pub fn status(_app: &AppHandle) -> AutostartStatus {
         AutostartStatus {
             enabled: false,
             disabled_by_windows: false,
             error: None,
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn run_command_program_is_extracted() {
+        assert_eq!(
+            command_exe(r#""C:\Users\me\AppData\Local\Synapse CPU\synapse.exe" --autostart"#),
+            Some(PathBuf::from(r"C:\Users\me\AppData\Local\Synapse CPU\synapse.exe"))
+        );
+        assert_eq!(
+            command_exe(r"C:\Apps\Synapse\synapse.EXE --autostart"),
+            Some(PathBuf::from(r"C:\Apps\Synapse\synapse.EXE"))
+        );
+        assert_eq!(
+            command_exe(r#"  "D:\Synapse\synapse.exe"  "#),
+            Some(PathBuf::from(r"D:\Synapse\synapse.exe"))
+        );
+        assert_eq!(command_exe(r#""C:\Apps\Synapse\synapse.exe"#), None);
+        assert_eq!(command_exe(r#""" --autostart"#), None);
+        assert_eq!(command_exe(r"synapse.exe --autostart"), None);
+        assert_eq!(command_exe(r"C:\Apps\Synapse\synapse --autostart"), None);
+        assert_eq!(command_exe(""), None);
     }
 }

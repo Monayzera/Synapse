@@ -42,8 +42,7 @@ Then open Settings from the widget, pick a model under **Voice**, and hold `Ctrl
 
 | Command | Output |
 |---|---|
-| `scripts\windows\build.bat` | Windows installer, NVIDIA GPU (requires the CUDA Toolkit) |
-| `scripts\windows\build-cpu.bat` | Windows installer, CPU only |
+| `scripts\windows\build.bat` | Windows installer for every PC, uses an NVIDIA GPU when available (building requires the CUDA Toolkit) |
 | `./scripts/macos/build-dmg.sh` | macOS `.dmg`, Apple Silicon |
 
 Output goes to `src-tauri/target/release/bundle/`.
