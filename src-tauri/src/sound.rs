@@ -16,6 +16,9 @@ pub fn play(start: bool) {
 }
 
 fn play_tone(start: bool) -> Result<(), ()> {
+    #[cfg(target_os = "linux")]
+    let host = cpal::host_from_id(cpal::HostId::Alsa).map_err(|_| ())?;
+    #[cfg(not(target_os = "linux"))]
     let host = cpal::default_host();
     let device = host.default_output_device().ok_or(())?;
     let supported = device.default_output_config().map_err(|_| ())?;

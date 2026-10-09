@@ -12,6 +12,11 @@ const RETRY_MAX: Duration = Duration::from_secs(30);
 const FALLBACK_CHECK: Duration = Duration::from_secs(5);
 const HEALTHY_AFTER: Duration = Duration::from_secs(30);
 const IDLE_WAIT: Duration = Duration::from_secs(30);
+#[cfg(target_os = "linux")]
+const PLAY_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[cfg(target_os = "linux")]
+static PULSE_HOST: Mutex<Option<Arc<cpal::Host>>> = Mutex::new(None);
 
 pub type Notifier = Arc<dyn Fn() + Send + Sync>;
 
@@ -170,8 +175,58 @@ fn enumerate_input_names() -> Vec<String> {
 }
 
 #[cfg(target_os = "linux")]
+fn audio_host() -> Arc<cpal::Host> {
+    let mut cached = PULSE_HOST.lock();
+    if let Some(host) = cached.as_ref() {
+        return host.clone();
+    }
+    let host = Arc::new(cpal::default_host());
+    if host.id() == cpal::HostId::PulseAudio {
+        *cached = Some(host.clone());
+    }
+    host
+}
+
+#[cfg(target_os = "linux")]
+fn forget_audio_host() {
+    PULSE_HOST.lock().take();
+}
+
+#[cfg(target_os = "linux")]
+fn play_bounded(stream: cpal::Stream) -> Result<cpal::Stream, String> {
+    let (tx, rx) = channel();
+    std::thread::Builder::new()
+        .name("synapse-audio-start".to_string())
+        .spawn(move || {
+            let started = stream.play();
+            let _ = tx.send((stream, started));
+        })
+        .map_err(|err| format!("start thread unavailable: {err}"))?;
+    match rx.recv_timeout(PLAY_TIMEOUT) {
+        Ok((stream, Ok(()))) => Ok(stream),
+        Ok((stream, Err(err))) => {
+            drop_quietly(stream);
+            Err(err.to_string())
+        }
+        Err(_) => Err(format!(
+            "no audio arrived within {} s",
+            PLAY_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_default_input(host: &cpal::Host) -> Option<cpal::Device> {
+    host.default_input_device().filter(|device| {
+        !device
+            .id()
+            .is_ok_and(|id| id.id().to_string().ends_with(".monitor"))
+    })
+}
+
+#[cfg(target_os = "linux")]
 fn enumerate_input_names() -> Vec<String> {
-    linux_input_entries(&cpal::default_host())
+    linux_input_entries(&audio_host())
         .into_iter()
         .map(|(name, _)| name)
         .collect()
@@ -183,6 +238,7 @@ fn linux_input_entries(host: &cpal::Host) -> Vec<(String, cpal::Device)> {
         Ok(devices) => devices,
         Err(err) => {
             tracing::warn!("audio device enumeration failed: {err}");
+            forget_audio_host();
             return Vec::new();
         }
     };
@@ -199,7 +255,30 @@ fn linux_input_entries(host: &cpal::Host) -> Vec<(String, cpal::Device)> {
             candidates.push((pcm_id, name, device));
         }
     }
-    choose_linux_entries(candidates)
+    if host.id() == cpal::HostId::PulseAudio {
+        choose_pulse_entries(candidates)
+    } else {
+        choose_linux_entries(candidates)
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn choose_pulse_entries<T>(candidates: Vec<(String, String, T)>) -> Vec<(String, T)> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut entries = Vec::new();
+    for (source_id, name, value) in candidates {
+        if source_id.ends_with(".monitor") {
+            continue;
+        }
+        let copies = seen.iter().filter(|other| **other == name).count();
+        seen.push(name.clone());
+        if copies == 0 {
+            entries.push((name, value));
+        } else {
+            entries.push((format!("{name} ({})", copies + 1), value));
+        }
+    }
+    entries
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -376,6 +455,8 @@ impl Worker {
             AudioCmd::StreamFailed(generation) => {
                 if generation == self.generation && self.stream.is_some() {
                     tracing::warn!("audio stream failed; scheduling rebuild");
+                    #[cfg(target_os = "linux")]
+                    forget_audio_host();
                     self.drop_stream();
                     shared.available.store(false, Ordering::Release);
                     self.schedule_retry();
@@ -449,12 +530,12 @@ impl Worker {
         self.backoff = (self.backoff * 2).min(RETRY_MAX);
     }
 
+    #[cfg(not(target_os = "linux"))]
     fn rebuild(&mut self, shared: &Shared, reason: &str) {
         self.drop_stream();
         self.retry_at = None;
         self.generation = self.generation.wrapping_add(1);
-        let built = build_stream(&self.preferred, shared, self.generation);
-        match built {
+        match build_stream(&self.preferred, shared, self.generation) {
             Ok(built) => {
                 let started = if self.active {
                     built.stream.play()
@@ -472,32 +553,21 @@ impl Worker {
                         shared.available.store(false, Ordering::Release);
                         self.schedule_retry();
                     }
-                    #[cfg(target_os = "linux")]
-                    Err(err) => {
-                        tracing::warn!(
-                            "audio input '{}' could not be paused ({err}); releasing it until recording starts",
-                            built.name
-                        );
-                        drop_quietly(built.stream);
-                        shared.available.store(true, Ordering::Release);
-                    }
                     other => {
                         if let Err(err) = other {
                             tracing::debug!("audio stream pause after build failed: {err}");
                         }
-                        if !(cfg!(target_os = "linux") && built.fallback && self.on_fallback) {
-                            tracing::info!(
-                                "audio input ready: '{}' ({} Hz, {} ch{}) [{reason}]",
-                                built.name,
-                                built.sample_rate,
-                                built.channels,
-                                if built.fallback {
-                                    ", preferred device missing, using default"
-                                } else {
-                                    ""
-                                }
-                            );
-                        }
+                        tracing::info!(
+                            "audio input ready: '{}' ({} Hz, {} ch{}) [{reason}]",
+                            built.name,
+                            built.sample_rate,
+                            built.channels,
+                            if built.fallback {
+                                ", preferred device missing, using default"
+                            } else {
+                                ""
+                            }
+                        );
                         self.stream = Some(built.stream);
                         self.on_fallback = built.fallback;
                         self.built_at = Some(Instant::now());
@@ -507,6 +577,78 @@ impl Worker {
                 }
             }
             Err(err) => {
+                self.failures = self.failures.saturating_add(1);
+                if self.failures == 1 || self.failures % 10 == 0 {
+                    tracing::warn!(
+                        "audio input unavailable ({err}) [{reason}]; attempt {} will retry",
+                        self.failures
+                    );
+                } else {
+                    tracing::debug!("audio input still unavailable ({err})");
+                }
+                shared.available.store(false, Ordering::Release);
+                self.schedule_retry();
+            }
+        }
+        shared.settled.store(true, Ordering::Release);
+        (shared.notify)();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn rebuild(&mut self, shared: &Shared, reason: &str) {
+        self.drop_stream();
+        self.retry_at = None;
+        self.generation = self.generation.wrapping_add(1);
+        match build_stream(&self.preferred, shared, self.generation) {
+            Ok(built) if !self.active => {
+                tracing::info!(
+                    "audio input available: '{}' ({} Hz, {} ch) [{reason}]; released until recording starts",
+                    built.name,
+                    built.sample_rate,
+                    built.channels
+                );
+                drop_quietly(built.stream);
+                self.backoff = RETRY_MIN;
+                self.failures = 0;
+                shared.available.store(true, Ordering::Release);
+            }
+            Ok(built) => {
+                let Built {
+                    stream,
+                    name,
+                    fallback,
+                    sample_rate,
+                    channels,
+                } = built;
+                match play_bounded(stream) {
+                    Ok(stream) => {
+                        tracing::info!(
+                            "audio input ready: '{name}' ({sample_rate} Hz, {channels} ch{}) [{reason}]",
+                            if fallback {
+                                ", preferred device missing, using default"
+                            } else {
+                                ""
+                            }
+                        );
+                        self.stream = Some(stream);
+                        self.on_fallback = fallback;
+                        self.built_at = Some(Instant::now());
+                        self.fallback_check_at = Instant::now() + FALLBACK_CHECK;
+                        self.backoff = RETRY_MIN;
+                        self.failures = 0;
+                        shared.available.store(true, Ordering::Release);
+                    }
+                    Err(err) => {
+                        tracing::warn!("audio input '{name}' could not start ({err}); will retry");
+                        forget_audio_host();
+                        self.failures = self.failures.saturating_add(1);
+                        shared.available.store(false, Ordering::Release);
+                        self.schedule_retry();
+                    }
+                }
+            }
+            Err(err) => {
+                forget_audio_host();
                 self.failures = self.failures.saturating_add(1);
                 if self.failures == 1 || self.failures % 10 == 0 {
                     tracing::warn!(
@@ -571,7 +713,7 @@ fn preferred_present(preferred: &Option<String>) -> bool {
         Some(target) => target,
         None => return false,
     };
-    linux_input_entries(&cpal::default_host())
+    linux_input_entries(&audio_host())
         .iter()
         .any(|(name, _)| name == target)
 }
@@ -603,9 +745,9 @@ fn select_device(host: &cpal::Host, preferred: &Option<String>) -> Option<(cpal:
             {
                 return Some((device, false));
             }
-            host.default_input_device().map(|device| (device, true))
+            linux_default_input(host).map(|device| (device, true))
         }
-        None => host.default_input_device().map(|device| (device, false)),
+        None => linux_default_input(host).map(|device| (device, false)),
     }
 }
 
@@ -621,12 +763,28 @@ fn error_callback(tx: Sender<AudioCmd>, generation: u64) -> impl FnMut(cpal::Err
     }
 }
 
+#[cfg(target_os = "linux")]
+fn linux_stream_config(
+    host: &cpal::Host,
+    sample_format: cpal::SampleFormat,
+    mut config: cpal::StreamConfig,
+) -> (cpal::SampleFormat, cpal::StreamConfig) {
+    if host.id() != cpal::HostId::PulseAudio {
+        return (sample_format, config);
+    }
+    config.buffer_size = cpal::BufferSize::Fixed((config.sample_rate / 100).max(1));
+    (cpal::SampleFormat::F32, config)
+}
+
 fn build_stream(
     device_name_pref: &Option<String>,
     shared: &Shared,
     generation: u64,
 ) -> AppResult<Built> {
+    #[cfg(not(target_os = "linux"))]
     let host = cpal::default_host();
+    #[cfg(target_os = "linux")]
+    let host = audio_host();
     let (device, fallback) = select_device(&host, device_name_pref)
         .ok_or_else(|| AppError::Audio("no input device available".to_string()))?;
     let name = device_name(&device).unwrap_or_else(|| "unnamed input".to_string());
@@ -637,6 +795,8 @@ fn build_stream(
 
     let sample_format = supported.sample_format();
     let config: cpal::StreamConfig = supported.into();
+    #[cfg(target_os = "linux")]
+    let (sample_format, config) = linux_stream_config(&host, sample_format, config);
 
     shared.sample_rate.store(config.sample_rate, Ordering::Release);
     shared.channels.store(config.channels as u32, Ordering::Release);
@@ -792,7 +952,7 @@ fn resample(input: &[f32], in_rate: u32, out_rate: u32) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{choose_linux_entries, linux_pcm_rank};
+    use super::{choose_linux_entries, choose_pulse_entries, linux_pcm_rank};
 
     fn entry(pcm_id: &str, name: &str, value: u32) -> (String, String, u32) {
         (pcm_id.to_string(), name.to_string(), value)
@@ -907,6 +1067,28 @@ mod tests {
             vec![
                 ("HDA Intel PCH, ALC897 Analog".to_string(), 1),
                 ("HDA Intel PCH, ALC897 Analog (PCH)".to_string(), 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn pulse_entries_skip_monitors_and_number_duplicate_names() {
+        let candidates = vec![
+            entry(
+                "alsa_output.usb-Actions_USB_Audio___HID-01.analog-stereo.monitor",
+                "Monitor of USB Audio & HID Analog Stereo",
+                1,
+            ),
+            entry("alsa_input.usb-Actions_USB_Audio___HID-01.mono-fallback", "USB Audio & HID Mono", 2),
+            entry("alsa_input.pci-0000_00_1b.0.analog-stereo", "Built-in Audio Analog Stereo", 3),
+            entry("alsa_input.usb-Other_USB_Audio___HID-02.mono-fallback", "USB Audio & HID Mono", 4),
+        ];
+        assert_eq!(
+            choose_pulse_entries(candidates),
+            vec![
+                ("USB Audio & HID Mono".to_string(), 2),
+                ("Built-in Audio Analog Stereo".to_string(), 3),
+                ("USB Audio & HID Mono (2)".to_string(), 4),
             ]
         );
     }

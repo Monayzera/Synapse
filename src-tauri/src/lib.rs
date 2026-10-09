@@ -1409,7 +1409,7 @@ fn open_log(dir: &Path, primary: bool) -> Option<(std::fs::File, PathBuf)> {
 
 fn init_tracing(log_dir: &Path, primary: bool) {
     let default_filter = if cfg!(target_os = "linux") {
-        "info,ort=warn,zbus=error"
+        "info,ort=warn,zbus=error,pulseaudio=off"
     } else {
         "info,ort=warn"
     };

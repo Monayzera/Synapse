@@ -54,6 +54,7 @@ block2 = "0.6.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "global_shortcuts", "remote_desktop", "screencast"] }
+cpal = { version = "0.18.1", features = ["pulseaudio"] }
 gdk = "0.18.2"
 gtk = "0.18.2"
 libc = "0.2"

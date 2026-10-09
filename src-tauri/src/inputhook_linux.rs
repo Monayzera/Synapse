@@ -36,7 +36,7 @@ const TOGGLE_RETRY_STEP: Duration = Duration::from_millis(100);
 const TOGGLE_RETRY_STEPS: u32 = 50;
 const PORTAL_BUS_NAME: &str = "org.freedesktop.portal.Desktop";
 const DENIED_FILE: &str = "denied_shortcut";
-const RELEASE_GRACE: Duration = Duration::from_millis(400);
+const RELEASE_GRACE: Duration = Duration::from_millis(150);
 const KEYBOARD_SCHEMA: &str = "org.gnome.desktop.peripherals.keyboard";
 
 const NAMED_KEYS: &[(&str, &str, u32)] = &[
@@ -637,6 +637,7 @@ async fn key_repeat() -> Option<KeyRepeat> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Beat {
     pressed_at: Duration,
+    last_at: Duration,
     last: Instant,
     repeated: bool,
 }
@@ -664,8 +665,14 @@ fn activation_action(
     }
     match (repeat, beat) {
         (Some(KeyRepeat::Off), _) => Activation::PressAgain,
-        (Some(KeyRepeat::On { delay, .. }), Some(beat))
-            if !beat.repeated && timestamp.saturating_sub(beat.pressed_at) < delay / 2 =>
+        (Some(KeyRepeat::On { interval, .. }), Some(beat))
+            if timestamp.saturating_sub(beat.last_at) <= interval * 2 =>
+        {
+            Activation::Repeat
+        }
+        (Some(KeyRepeat::On { delay, interval }), Some(beat))
+            if !beat.repeated
+                && timestamp.saturating_sub(beat.pressed_at) < delay.saturating_sub(interval) =>
         {
             Activation::PressAgain
         }
@@ -1014,6 +1021,7 @@ async fn listen(
                             Activation::Repeat => {
                                 if let Some(current) = beat.as_mut() {
                                     current.last = now;
+                                    current.last_at = timestamp;
                                     current.repeated = true;
                                 }
                             }
@@ -1024,6 +1032,7 @@ async fn listen(
                                 press_shortcut();
                                 beat = Some(Beat {
                                     pressed_at: timestamp,
+                                    last_at: timestamp,
                                     last: now,
                                     repeated: false,
                                 });
@@ -1466,6 +1475,7 @@ mod tests {
         let on = Some(key_repeat_from(true, 500, 30));
         let first = Beat {
             pressed_at: Duration::from_millis(1_000),
+            last_at: Duration::from_millis(1_000),
             last: Instant::now(),
             repeated: false,
         };
@@ -1473,6 +1483,12 @@ mod tests {
         assert_eq!(activation_action(false, None, on, ms(1_000), None), Activation::Press);
         assert_eq!(activation_action(true, Some(first), on, ms(1_500), None), Activation::Repeat);
         assert_eq!(activation_action(true, Some(first), on, ms(1_100), None), Activation::PressAgain);
+        assert_eq!(activation_action(true, Some(first), on, ms(1_300), None), Activation::PressAgain);
+        assert_eq!(activation_action(true, Some(first), on, ms(1_469), None), Activation::PressAgain);
+        assert_eq!(activation_action(true, Some(first), on, ms(1_501), None), Activation::Repeat);
+        assert_eq!(activation_action(true, Some(first), on, ms(1_030), None), Activation::Repeat);
+        assert_eq!(activation_action(true, Some(first), on, ms(1_060), None), Activation::Repeat);
+        assert_eq!(activation_action(true, Some(first), on, ms(1_061), None), Activation::PressAgain);
         let repeating = Beat { repeated: true, ..first };
         assert_eq!(activation_action(true, Some(repeating), on, ms(1_100), None), Activation::Repeat);
         assert_eq!(
