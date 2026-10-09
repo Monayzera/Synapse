@@ -52,6 +52,13 @@ tauri-plugin-autostart = "2"
 objc2 = "0.6.4"
 block2 = "0.6.2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "global_shortcuts", "remote_desktop", "screencast"] }
+gdk = "0.18.2"
+gtk = "0.18.2"
+libc = "0.2"
+x11rb = { version = "0.13.2", features = ["xkb"] }
+
 [profile.release]
 opt-level = 3
 lto = true
@@ -64,3 +71,4 @@ default = ["vad"]
 cuda = ["whisper-rs/cuda"]
 vad = ["dep:ort"]
 metal = ["whisper-rs/metal"]
+vulkan = ["whisper-rs/vulkan"]

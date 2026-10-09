@@ -215,6 +215,15 @@ impl Settings {
         } else {
             std::time::Duration::from_millis(250)
         };
+        #[cfg(target_os = "linux")]
+        {
+            let outcome = Self::load_with_budget(path, budget, present);
+            if matches!(outcome, LoadOutcome::Loaded(..)) {
+                restrict_saved_files(path);
+            }
+            outcome
+        }
+        #[cfg(not(target_os = "linux"))]
         Self::load_with_budget(path, budget, present)
     }
 
@@ -326,6 +335,15 @@ fn bak_path(path: &Path) -> std::path::PathBuf {
     path.with_extension("bak")
 }
 
+#[cfg(target_os = "linux")]
+fn restrict_saved_files(path: &Path) {
+    for file in [path.to_path_buf(), bak_path(path)] {
+        if let Err(err) = crate::atomic_io::restrict_existing(&file) {
+            tracing::warn!("could not restrict {} to its owner: {err}", file.display());
+        }
+    }
+}
+
 fn backup_corrupt(path: &Path, content: &str) {
     if content.is_empty() {
         return;
@@ -335,7 +353,11 @@ fn backup_corrupt(path: &Path, content: &str) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let backup = path.with_extension(format!("corrupt-{stamp}.json"));
-    if let Err(err) = std::fs::write(&backup, content) {
+    #[cfg(target_os = "linux")]
+    let written = crate::atomic_io::write_durable(&backup, content.as_bytes());
+    #[cfg(not(target_os = "linux"))]
+    let written = std::fs::write(&backup, content);
+    if let Err(err) = written {
         tracing::warn!("failed to save corrupt settings backup: {err}");
     }
 }
@@ -555,5 +577,27 @@ mod tests {
         assert_eq!(merged.paste_delay_ms, 1000);
         assert_eq!(merged.llm_timeout_ms, 500);
         assert!(merged.llm_temperature.abs() < f32::EPSILON);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn corrupt_backup_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("synapse_cfg_corrupt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("settings.json");
+        let content = "{ not valid json ";
+        backup_corrupt(&p, content);
+        let backups: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(backups.len(), 1);
+        let mode = std::fs::metadata(&backups[0]).unwrap().permissions().mode() & 0o777;
+        let saved = std::fs::read_to_string(&backups[0]).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(mode, 0o600);
+        assert_eq!(saved, content);
     }
 }

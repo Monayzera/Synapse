@@ -117,6 +117,8 @@ jobs:
             echo "|---|---|"
             echo "| \`Synapse_${VERSION}_windows_x64-setup.exe\` | Any Windows PC (uses an NVIDIA GPU when available) |"
             echo "| \`Synapse_${VERSION}_macos_arm64.dmg\` | Mac with Apple Silicon |"
+            echo "| \`Synapse_${VERSION}_linux_x86_64.AppImage\` | Linux x86_64, Ubuntu 24.04 or newer (uses a Vulkan GPU when available). Run \`chmod +x\` on the file, then start it. |"
+            echo "| \`Synapse_${VERSION}_linux_x86_64.deb\` | Ubuntu 24.04 or newer. Install with \`sudo apt install ./Synapse_${VERSION}_linux_x86_64.deb\` |"
             echo
             echo "## First launch"
             echo
@@ -176,6 +178,11 @@ jobs:
             timeout: 120
             args: '--features metal --bundles app,dmg'
             asset: 'Synapse_[version]_macos_arm64[ext]'
+          - variant: linux-x86_64
+            os: ubuntu-24.04
+            timeout: 240
+            args: '--features vulkan --bundles appimage,deb'
+            asset: 'Synapse_[version]_linux_x86_64[ext]'
     env:
       GGML_NATIVE: 'OFF'
     steps:
@@ -288,6 +295,24 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'cl.exe not on PATH' }
           cmake --version
           ninja --version
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages=(
+            libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev
+            libayatana-appindicator3-dev librsvg2-dev libgtk-3-dev patchelf xdg-utils
+            libfuse2t64 pkg-config libasound2-dev cmake clang libclang-dev libvulkan-dev
+            glslc libxkbcommon-dev libdbus-1-dev
+          )
+          for attempt in 1 2 3; do
+            if sudo apt-get update -qq && sudo apt-get install -y -qq "${packages[@]}"; then exit 0; fi
+            sleep 10
+          done
+          echo "::error::Could not install the Linux build dependencies"
+          exit 1
 
       - uses: actions/setup-node@v7
         with:
@@ -448,8 +473,10 @@ jobs:
           mkdir -p "${work}"
           windows="Synapse_${V}_windows_x64-setup.exe"
           mac="Synapse_${V}_macos_arm64.app.tar.gz"
-          updaters=("${windows}" "${mac}")
+          linux="Synapse_${V}_linux_x86_64.AppImage"
+          updaters=("${windows}" "${mac}" "${linux}")
           expected=("Synapse_${V}_macos_arm64.dmg")
+          expected+=("Synapse_${V}_linux_x86_64.deb")
           for f in "${updaters[@]}"; do expected+=("${f}" "${f}.sig"); done
           gh api --paginate "repos/${R}/releases/${ID}/assets?per_page=100" --jq '.[] | [.id, .name, .state, .size] | @tsv' > "${work}/assets.tsv"
           cat "${work}/assets.tsv"
@@ -493,13 +520,15 @@ jobs:
             --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --arg win_url "${base}/${windows}" --rawfile win_sig "${work}/${windows}.sig" \
             --arg mac_url "${base}/${mac}" --rawfile mac_sig "${work}/${mac}.sig" \
+            --arg linux_url "${base}/${linux}" --rawfile linux_sig "${work}/${linux}.sig" \
             '{version: $version, notes: $notes, pub_date: $date, platforms: {
               "windows-x86_64": {signature: ($win_sig | rtrimstr("\n")), url: $win_url},
               "windows-x86_64-nvidia": {signature: ($win_sig | rtrimstr("\n")), url: $win_url},
               "windows-x86_64-cpu": {signature: ($win_sig | rtrimstr("\n")), url: $win_url},
-              "darwin-aarch64": {signature: ($mac_sig | rtrimstr("\n")), url: $mac_url}
+              "darwin-aarch64": {signature: ($mac_sig | rtrimstr("\n")), url: $mac_url},
+              "linux-x86_64": {signature: ($linux_sig | rtrimstr("\n")), url: $linux_url}
             }}' > "${work}/latest.json"
-          jq -e --arg v "${V}" '.version == $v and (.platforms | length) == 4 and ([.platforms[] | ((.signature | length) > 0) and (.url | startswith("https://github.com/"))] | all)' "${work}/latest.json" > /dev/null
+          jq -e --arg v "${V}" '.version == $v and (.platforms | length) == 5 and ([.platforms[] | ((.signature | length) > 0) and (.url | startswith("https://github.com/"))] | all)' "${work}/latest.json" > /dev/null
           cat "${work}/latest.json"
           curl -fsS -X POST \
             -H "Authorization: Bearer ${GH_TOKEN}" \

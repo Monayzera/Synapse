@@ -90,8 +90,25 @@ fn os_language() -> &'static str {
 
 #[cfg(not(any(windows, target_os = "macos")))]
 fn os_language() -> &'static str {
-    let lang = std::env::var("LANG").unwrap_or_default();
-    if lang.to_ascii_lowercase().starts_with("pt") {
+    posix_language(
+        ["LC_ALL", "LC_MESSAGES", "LANGUAGE", "LANG"]
+            .into_iter()
+            .map(|name| std::env::var(name).ok()),
+    )
+}
+
+#[cfg(any(test, not(any(windows, target_os = "macos"))))]
+fn posix_language<I>(values: I) -> &'static str
+where
+    I: IntoIterator<Item = Option<String>>,
+{
+    let first = values
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.split(':').next().map(str::to_owned))
+        .find(|value| !value.is_empty())
+        .unwrap_or_default();
+    if first.to_ascii_lowercase().starts_with("pt") {
         "pt"
     } else {
         "en"
@@ -257,5 +274,43 @@ fn show(app: &AppHandle, label: &str) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::posix_language;
+
+    fn language(values: &[Option<&str>]) -> &'static str {
+        posix_language(values.iter().map(|value| value.map(str::to_owned)))
+    }
+
+    #[test]
+    fn posix_language_follows_locale_precedence() {
+        assert_eq!(language(&[None, None, None, Some("pt_BR.UTF-8")]), "pt");
+        assert_eq!(language(&[None, None, None, Some("en_US.UTF-8")]), "en");
+        assert_eq!(
+            language(&[Some("en_US.UTF-8"), None, None, Some("pt_BR.UTF-8")]),
+            "en"
+        );
+        assert_eq!(language(&[Some("C"), None, None, Some("pt_BR")]), "en");
+        assert_eq!(
+            language(&[Some(""), Some("pt_BR"), None, Some("en_US")]),
+            "pt"
+        );
+        assert_eq!(
+            language(&[None, Some("pt_PT"), Some("en"), Some("en_US")]),
+            "pt"
+        );
+        assert_eq!(
+            language(&[None, None, Some("pt_BR:en"), Some("en_US")]),
+            "pt"
+        );
+        assert_eq!(
+            language(&[None, None, Some("en:pt_BR"), Some("pt_BR")]),
+            "en"
+        );
+        assert_eq!(language(&[None, None, None, Some("POSIX")]), "en");
+        assert_eq!(language(&[None, None, None, None]), "en");
     }
 }

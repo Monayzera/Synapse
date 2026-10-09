@@ -115,7 +115,7 @@ impl TranscribeEngine {
         }
         let path_str = model_path.to_string_lossy().to_string();
 
-        let gpu_capable = cfg!(feature = "cuda") || cfg!(feature = "metal");
+        let gpu_capable = cfg!(feature = "cuda") || cfg!(feature = "metal") || cfg!(feature = "vulkan");
         if prefer_gpu && gpu_capable {
             match Self::try_load(&path_str, true) {
                 Ok(context) => {

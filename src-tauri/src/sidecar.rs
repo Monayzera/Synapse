@@ -64,6 +64,26 @@ impl Sidecar {
             let sep = if cfg!(windows) { ";" } else { ":" };
             command.env("PATH", format!("{}{sep}{current}", dir.display()));
         }
+        #[cfg(target_os = "linux")]
+        if let Some(dir) = exe.parent() {
+            prepend_library_path(&mut command, dir);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+            let parent = std::process::id();
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::getppid() as u32 != parent {
+                        return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+                    }
+                    Ok(())
+                });
+            }
+        }
 
         configure_no_window(&mut command);
         command.stdin(Stdio::null());
@@ -372,6 +392,22 @@ fn physical_estimate(logical: usize) -> usize {
     (logical / 2).max(2)
 }
 
+#[cfg(target_os = "linux")]
+pub fn prepend_library_path(command: &mut Command, dir: &Path) {
+    let current = std::env::var_os("LD_LIBRARY_PATH");
+    command.env("LD_LIBRARY_PATH", library_path_value(dir, current.as_deref()));
+}
+
+#[cfg(target_os = "linux")]
+fn library_path_value(dir: &Path, current: Option<&std::ffi::OsStr>) -> std::ffi::OsString {
+    let mut value = dir.as_os_str().to_os_string();
+    if let Some(current) = current.filter(|current| !current.is_empty()) {
+        value.push(":");
+        value.push(current);
+    }
+    value
+}
+
 #[cfg(windows)]
 fn assign_to_job(child: &Child) -> Option<JobHandle> {
     use std::os::windows::io::AsRawHandle;
@@ -452,6 +488,54 @@ mod tests {
         assert!(!same_model_path("", "", true));
         assert!(!same_model_path("/home/a/Model.gguf", "/home/a/model.gguf", false));
         assert!(same_model_path("/home/a/model.gguf", "/home/a/model.gguf", false));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn library_path_never_adds_an_empty_entry() {
+        use std::ffi::{OsStr, OsString};
+        assert_eq!(
+            library_path_value(Path::new("/a/bin"), None),
+            OsString::from("/a/bin")
+        );
+        assert_eq!(
+            library_path_value(Path::new("/a/bin"), Some(OsStr::new(""))),
+            OsString::from("/a/bin")
+        );
+        assert_eq!(
+            library_path_value(Path::new("/a/bin"), Some(OsStr::new("/usr/lib"))),
+            OsString::from("/a/bin:/usr/lib")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sidecar_runs_on_the_calling_thread() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "synapse-sidecar-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        assert!(std::fs::create_dir_all(&dir).is_ok());
+        let exe = dir.join("llama-server");
+        assert!(std::fs::write(&exe, "#!/bin/sh\nexec sleep 30\n").is_ok());
+        assert!(std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).is_ok());
+        let model = dir.join("model.gguf");
+        assert!(std::fs::write(&model, b"x").is_ok());
+        let log = dir.join("llama-server.log");
+
+        let Ok(mut sidecar) = Sidecar::spawn(&exe, &model, 1, 0, 512, "control", &log) else {
+            panic!("sidecar did not start");
+        };
+
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(sidecar.is_running());
+        sidecar.stop();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

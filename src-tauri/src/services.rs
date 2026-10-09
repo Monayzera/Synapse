@@ -458,7 +458,7 @@ async fn watch_sidecar(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub async fn probe_sidecar(state: &SharedState) {
     let settings = state.settings_snapshot();
     if !llm_wanted(&settings) || settings.llm_backend != LlmBackend::Local {

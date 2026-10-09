@@ -75,6 +75,7 @@ export const api = {
   autostartStatus: () => invoke<AutostartStatus>("autostart_status"),
   setAutostart: (enabled: boolean) => invoke<AutostartStatus>("set_autostart", { enabled }),
   openPrivacySettings: (kind: PrivacyKind) => invoke<void>("open_privacy_settings", { kind }),
+  retryHotkey: () => invoke<void>("retry_hotkey"),
   updateStatus: () => invoke<UpdateStatus>("update_status"),
   checkUpdate: () => invoke<void>("check_update"),
   installUpdate: () => invoke<void>("install_update"),
@@ -83,6 +84,12 @@ export const api = {
     invoke<void>("open_settings", { section }),
   openWindow: (label: string) => invoke<void>("open_window", { label }),
   hideWindow: (label: string) => invoke<void>("hide_window", { label }),
+  widgetMonitor: () =>
+    invoke<{
+      position: { x: number; y: number };
+      size: { width: number; height: number };
+    } | null>("widget_monitor"),
+  widgetResize: (width: number, height: number) => invoke<void>("widget_resize", { width, height }),
 };
 
 export function on<T>(event: string, handler: EventCallback<T>): Promise<UnlistenFn> {

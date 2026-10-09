@@ -131,6 +131,8 @@ enum Notice {
     Postponed,
     Busy,
     Relocate,
+    #[cfg(target_os = "linux")]
+    RestartNeeded,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -756,6 +758,11 @@ impl AutoUpdater {
             .updater_builder()
             .target(self.target.clone())
             .timeout(CHECK_TIMEOUT);
+        #[cfg(target_os = "linux")]
+        let builder = match appimage_path() {
+            Some(path) => builder.executable_path(path),
+            None => builder,
+        };
         #[cfg(windows)]
         let builder = {
             let hook = Arc::downgrade(self);
@@ -1192,7 +1199,7 @@ impl AutoUpdater {
         };
         let version = update.version.clone();
         if let Some(issue) = location_issue() {
-            if trigger != Trigger::Manual || issue == "location_move" {
+            if trigger != Trigger::Manual || issue == "location_move" || cfg!(target_os = "linux") {
                 tracing::warn!("update {version} not installed from this location ({issue})");
                 self.update_status(|status| {
                     status.error = Some(issue.to_string());
@@ -1241,11 +1248,15 @@ impl AutoUpdater {
         let pubkey = self.pubkey.clone();
         let announced = version.clone();
         let bytes = match tokio::task::spawn_blocking(move || {
-            read_verified(&source, &signature, &pubkey, &announced)
+            read_verified(&source, &signature, &pubkey, &announced).map(installable_image)
         })
         .await
         {
-            Ok(Ok(bytes)) => bytes,
+            Ok(Ok(Ok(bytes))) => bytes,
+            Ok(Ok(Err(detail))) => {
+                self.download_failed(Failure::new("unavailable", detail), &update);
+                return Err("verify");
+            }
             Ok(Err(VerifyError::Invalid(detail))) => {
                 remove_file_quietly(&path);
                 *self.file.lock() = None;
@@ -1298,7 +1309,7 @@ impl AutoUpdater {
         tracing::info!("installing update {version} (attempt {attempt}, {trigger:?}, relaunch {relaunch})");
         let installer = update.restart_after_install(relaunch);
         self.in_installer.store(true, Ordering::Release);
-        let outcome = tokio::task::spawn_blocking(move || installer.install(bytes)).await;
+        let outcome = tokio::task::spawn_blocking(move || install_payload(installer, bytes)).await;
         self.in_installer.store(false, Ordering::Release);
         match outcome {
             Ok(Ok(())) => {
@@ -1309,6 +1320,15 @@ impl AutoUpdater {
                 {
                     if relaunch && !self.quit_requested.load(Ordering::Acquire) {
                         self.app.request_restart();
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    if relaunch && !self.quit_requested.load(Ordering::Acquire) {
+                        match relaunch_appimage() {
+                            Ok(()) => self.finish_quit(),
+                            Err(detail) => self.relaunch_failed(detail, &version),
+                        }
                     }
                 }
                 Ok(())
@@ -1354,6 +1374,18 @@ impl AutoUpdater {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn relaunch_failed(&self, detail: String, version: &str) {
+        COMMITTED.store(false, Ordering::Release);
+        tracing::error!("update {version} installed but Synapse was not restarted: {detail}");
+        self.update_status(|status| {
+            status.phase = Phase::Error;
+            status.error = Some("relaunch".to_string());
+            status.detail = None;
+        });
+        self.announce(Notice::RestartNeeded, Some(version.to_string()));
+    }
+
     #[cfg(windows)]
     fn before_exit(&self) {
         self.hook_ran.store(true, Ordering::Release);
@@ -1397,13 +1429,31 @@ impl AutoUpdater {
 fn build_supported() -> bool {
     !cfg!(debug_assertions)
         && (cfg!(all(windows, target_arch = "x86_64"))
-            || cfg!(all(target_os = "macos", target_arch = "aarch64")))
+            || cfg!(all(target_os = "macos", target_arch = "aarch64"))
+            || appimage_build())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn appimage_build() -> bool {
+    use tauri::utils::{config::BundleType, platform::bundle_type};
+    appimage_path().is_some() && bundle_type() == Some(BundleType::AppImage)
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn appimage_build() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn appimage_path() -> Option<PathBuf> {
+    crate::linux_portal::appimage_path()
 }
 
 fn target_key(os: &str) -> Option<&'static str> {
     match os {
         "windows" => Some("windows-x86_64"),
         "macos" => Some("darwin-aarch64"),
+        "linux" => Some("linux-x86_64"),
         _ => None,
     }
 }
@@ -1456,6 +1506,22 @@ fn location_issue() -> Option<&'static str> {
     let Some(parent) = bundle.parent() else {
         return Some("location_move");
     };
+    folder_issue(parent)
+}
+
+#[cfg(target_os = "linux")]
+fn location_issue() -> Option<&'static str> {
+    let Some(appimage) = appimage_path() else {
+        return Some("location_move");
+    };
+    let Some(parent) = appimage.parent() else {
+        return Some("location_move");
+    };
+    folder_issue(parent)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn folder_issue(parent: &Path) -> Option<&'static str> {
     let probe = parent.join(format!(".synapse-update-{}", std::process::id()));
     match std::fs::File::create(&probe) {
         Ok(file) => {
@@ -1470,9 +1536,127 @@ fn location_issue() -> Option<&'static str> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn location_issue() -> Option<&'static str> {
     None
+}
+
+#[cfg(target_os = "linux")]
+const RELAUNCH_SCRIPT: &str = r#"while kill -0 "$1" 2>/dev/null && ! grep -q '^State:[[:space:]]*Z' "/proc/$1/status" 2>/dev/null; do sleep 0.2; done; shift; exec "$@""#;
+
+#[cfg(target_os = "linux")]
+fn relaunch_appimage() -> Result<(), String> {
+    let appimage = appimage_path().ok_or_else(|| "the AppImage path is unknown".to_string())?;
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    tracing::info!(
+        "restarting Synapse from {} once it exits",
+        appimage.display()
+    );
+    spawn_relaunch(std::process::id(), &appimage, &args)
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_relaunch(waited: u32, target: &Path, args: &[std::ffi::OsString]) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    Command::new("sh")
+        .arg("-c")
+        .arg(RELAUNCH_SCRIPT)
+        .arg("sh")
+        .arg(waited.to_string())
+        .arg(target)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .process_group(0)
+        .spawn()
+        .map(drop)
+        .map_err(|err| format!("relaunch helper not started: {err}"))
+}
+
+#[cfg(target_os = "linux")]
+fn installable_image(payload: Vec<u8>) -> Result<Vec<u8>, String> {
+    let image = if payload.starts_with(&[0x1f, 0x8b]) {
+        extract_appimage(&payload)?
+    } else {
+        payload
+    };
+    if image.starts_with(b"\x7fELF") {
+        Ok(image)
+    } else {
+        Err("the update is not an AppImage".to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn extract_appimage(archive: &[u8]) -> Result<Vec<u8>, String> {
+    let unreadable = |err: std::io::Error| format!("the update archive is unreadable: {err}");
+    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(archive));
+    for entry in tar.entries().map_err(unreadable)? {
+        let mut entry = entry.map_err(unreadable)?;
+        let is_image = entry.header().entry_type().is_file()
+            && entry
+                .path()
+                .is_ok_and(|path| path.extension().is_some_and(|ext| ext == "AppImage"));
+        if !is_image {
+            continue;
+        }
+        let mut image = Vec::new();
+        entry.read_to_end(&mut image).map_err(unreadable)?;
+        return Ok(image);
+    }
+    Err("the update archive has no AppImage".to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn installable_image(payload: Vec<u8>) -> Result<Vec<u8>, String> {
+    Ok(payload)
+}
+
+#[cfg(target_os = "linux")]
+fn install_payload(_installer: Update, bytes: Vec<u8>) -> Result<(), String> {
+    let target = appimage_path().ok_or_else(|| "the AppImage path is unknown".to_string())?;
+    replace_appimage(&target, &bytes)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_payload(installer: Update, bytes: Vec<u8>) -> Result<(), String> {
+    installer.install(bytes).map_err(|err| err.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn replace_appimage(target: &Path, image: &[u8]) -> Result<(), String> {
+    let (Some(dir), Some(name)) = (target.parent(), target.file_name()) else {
+        return Err("the AppImage path is unknown".to_string());
+    };
+    let staged = dir.join(format!(".{}.update", name.to_string_lossy()));
+    remove_file_quietly(&staged);
+    if let Err(err) = write_staged(&staged, image).and_then(|()| std::fs::rename(&staged, target)) {
+        remove_file_quietly(&staged);
+        return Err(format!(
+            "the new AppImage could not replace {}: {err}",
+            target.display()
+        ));
+    }
+    if let Err(err) = std::fs::File::open(dir).and_then(|folder| folder.sync_all()) {
+        tracing::warn!("could not sync {} after the update: {err}", dir.display());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn write_staged(path: &Path, image: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(image)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
 }
 
 fn now_ms() -> i64 {
@@ -1836,10 +2020,21 @@ fn notice_text(language: &str, notice: Notice, version: &str) -> (String, String
                 "Atualização aguardando",
                 "Aguarde o Synapse terminar o que está fazendo.",
             ),
-            Notice::Relocate => (
-                "Mova o Synapse para atualizar",
-                "Mova o Synapse para a pasta Aplicativos e abra de novo para instalar a versão {v}.",
-            ),
+            Notice::Relocate => {
+                if cfg!(target_os = "linux") {
+                    (
+                        "Mova o AppImage para uma pasta com permissão de escrita para atualizar",
+                        "",
+                    )
+                } else {
+                    (
+                        "Mova o Synapse para atualizar",
+                        "Mova o Synapse para a pasta Aplicativos e abra de novo para instalar a versão {v}.",
+                    )
+                }
+            }
+            #[cfg(target_os = "linux")]
+            Notice::RestartNeeded => ("Reinicie o Synapse para concluir a atualização", ""),
         }
     } else {
         match notice {
@@ -1876,10 +2071,18 @@ fn notice_text(language: &str, notice: Notice, version: &str) -> (String, String
                 "Update waiting",
                 "Wait for Synapse to finish what it's doing.",
             ),
-            Notice::Relocate => (
-                "Move Synapse to update",
-                "Move Synapse to the Applications folder and open it again to install version {v}.",
-            ),
+            Notice::Relocate => {
+                if cfg!(target_os = "linux") {
+                    ("Move the AppImage to a writable folder to update", "")
+                } else {
+                    (
+                        "Move Synapse to update",
+                        "Move Synapse to the Applications folder and open it again to install version {v}.",
+                    )
+                }
+            }
+            #[cfg(target_os = "linux")]
+            Notice::RestartNeeded => ("Restart Synapse to finish the update", ""),
         }
     };
     (title.to_string(), body.replace("{v}", version))
@@ -2082,7 +2285,8 @@ mod tests {
         assert_eq!(main["productName"].as_str(), Some("Synapse"));
         assert_eq!(target_key("windows"), Some("windows-x86_64"));
         assert_eq!(target_key("macos"), Some("darwin-aarch64"));
-        assert_eq!(target_key("linux"), None);
+        assert_eq!(target_key("linux"), Some("linux-x86_64"));
+        assert_eq!(target_key("freebsd"), None);
         assert_eq!(
             main["bundle"]["windows"]["nsis"]["installerHooks"].as_str(),
             Some("./windows/hooks.nsh")
@@ -2091,6 +2295,164 @@ mod tests {
         assert!(hooks.contains("!macro NSIS_HOOK_PREINSTALL"));
         assert!(hooks.contains("!macro NSIS_HOOK_POSTINSTALL"));
         assert!(hooks.contains(LEGACY_APP_NAME));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn tar_gz(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut builder = tar::Builder::new(Vec::new());
+        for &(name, data) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o755);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_size(data.len() as u64);
+            builder.append_data(&mut header, name, data).unwrap();
+        }
+        let tar_bytes = builder.into_inner().unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&tar_bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_payload_yields_the_appimage_only() {
+        let image = b"\x7fELF appimage bytes".to_vec();
+        let archive = tar_gz(&[("README", b"notes"), ("Synapse.AppImage", &image)]);
+        assert_eq!(installable_image(archive), Ok(image.clone()));
+        assert_eq!(installable_image(image.clone()), Ok(image));
+        assert_eq!(
+            installable_image(tar_gz(&[("README", b"notes")])),
+            Err("the update archive has no AppImage".to_string())
+        );
+        assert_eq!(
+            installable_image(tar_gz(&[("Synapse.AppImage", b"<html>")])),
+            Err("the update is not an AppImage".to_string())
+        );
+        assert_eq!(
+            installable_image(b"<html>".to_vec()),
+            Err("the update is not an AppImage".to_string())
+        );
+        assert!(installable_image(vec![0x1f, 0x8b, 0x00]).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_notices_reuse_the_in_app_sentences() {
+        assert_eq!(
+            notice_text("pt", Notice::RestartNeeded, "7.8.9"),
+            (
+                "Reinicie o Synapse para concluir a atualização".to_string(),
+                String::new()
+            )
+        );
+        assert_eq!(
+            notice_text("en", Notice::RestartNeeded, "7.8.9"),
+            (
+                "Restart Synapse to finish the update".to_string(),
+                String::new()
+            )
+        );
+        assert_eq!(
+            notice_text("pt", Notice::Relocate, "7.8.9"),
+            (
+                "Mova o AppImage para uma pasta com permissão de escrita para atualizar"
+                    .to_string(),
+                String::new()
+            )
+        );
+        assert_eq!(
+            notice_text("en", Notice::Relocate, "7.8.9"),
+            (
+                "Move the AppImage to a writable folder to update".to_string(),
+                String::new()
+            )
+        );
+        let value = serde_json::to_value(NoticePayload {
+            kind: Notice::RestartNeeded,
+            version: None,
+        })
+        .unwrap();
+        assert_eq!(value["kind"], "restart_needed");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relaunch_waits_for_the_old_process_then_runs_the_target() {
+        let marker = scratch("relaunch.marker");
+        let mut old = std::process::Command::new("sleep")
+            .arg("1")
+            .spawn()
+            .unwrap();
+        spawn_relaunch(
+            old.id(),
+            Path::new("touch"),
+            &[marker.clone().into_os_string()],
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(!marker.exists());
+        old.wait().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(marker.exists());
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relaunch_does_not_wait_on_a_zombie() {
+        let marker = scratch("relaunch-zombie.marker");
+        let mut old = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        spawn_relaunch(
+            old.id(),
+            Path::new("touch"),
+            &[marker.clone().into_os_string()],
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(marker.exists());
+        let _ = std::fs::remove_file(&marker);
+        old.wait().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn appimage_replacement_leaves_one_executable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("replace-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("Synapse.AppImage");
+        std::fs::write(&target, b"\x7fELF old").unwrap();
+        replace_appimage(&target, b"\x7fELF new").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"\x7fELF new");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+        assert_eq!(names(&dir), vec!["Synapse.AppImage".to_string()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn appimage_replacement_failure_keeps_the_current_file() {
+        let dir = scratch("replace-missing");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("Synapse.AppImage");
+        std::fs::write(&target, b"\x7fELF old").unwrap();
+        let unreachable = dir.join("gone").join("Synapse.AppImage");
+        assert!(replace_appimage(&unreachable, b"\x7fELF new").is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"\x7fELF old");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2308,6 +2670,17 @@ mod tests {
         assert_eq!(tray_item(&status), TrayItem::Check);
     }
 
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn relocate_notice_names_the_version_in_both_languages() {
+        for language in ["pt", "en"] {
+            let (title, body) = notice_text(language, Notice::Relocate, "7.8.9");
+            assert!(!title.is_empty());
+            assert!(body.contains("7.8.9"), "{language}");
+            assert!(!body.contains("{v}"));
+        }
+    }
+
     #[test]
     fn notices_name_the_version_in_both_languages() {
         for notice in [
@@ -2318,7 +2691,6 @@ mod tests {
             Notice::Available,
             Notice::Failed,
             Notice::Postponed,
-            Notice::Relocate,
         ] {
             for language in ["pt", "en"] {
                 let (title, body) = notice_text(language, notice, "7.8.9");

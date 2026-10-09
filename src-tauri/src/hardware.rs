@@ -12,17 +12,17 @@ const WHISPER_GPU_BLOCK_STRIKES: u32 = 2;
 const MARK_REMOVE_ATTEMPTS: u32 = 5;
 const CUDA_VISIBLE_DEVICES: &str = "CUDA_VISIBLE_DEVICES";
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", test))]
 const VENDOR_NVIDIA: u32 = 0x10DE;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", test))]
 const VENDOR_AMD: u32 = 0x1002;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", test))]
 const VENDOR_INTEL: u32 = 0x8086;
 #[cfg(windows)]
 const VENDOR_MICROSOFT: u32 = 0x1414;
 #[cfg(windows)]
 const MAX_ADAPTERS: u32 = 16;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 const NVIDIA_SMI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 static GPU_CACHE: Mutex<Option<Option<GpuInfo>>> = Mutex::new(None);
@@ -119,6 +119,7 @@ pub enum WhisperGpu {
     Allowed,
     NotCompiled,
     NoNvidia,
+    NoGpu,
     Unsupported,
     Blocked,
 }
@@ -133,6 +134,7 @@ impl WhisperGpu {
             WhisperGpu::Allowed => "the graphics card can run whisper",
             WhisperGpu::NotCompiled => "this build has no GPU support for whisper",
             WhisperGpu::NoNvidia => "no NVIDIA graphics card was found",
+            WhisperGpu::NoGpu => "no graphics card with Vulkan support was found",
             WhisperGpu::Unsupported => {
                 "an NVIDIA graphics card's compute capability is not covered by the bundled whisper GPU kernels"
             }
@@ -150,6 +152,7 @@ fn uncovered(gpu: &GpuInfo) -> bool {
 fn whisper_gpu_for(
     cuda: bool,
     metal: bool,
+    vulkan: bool,
     gpu: Option<&GpuInfo>,
     nvidia: &[GpuInfo],
     blocked: bool,
@@ -158,7 +161,16 @@ fn whisper_gpu_for(
         return WhisperGpu::Allowed;
     }
     if !cuda {
-        return WhisperGpu::NotCompiled;
+        if !vulkan {
+            return WhisperGpu::NotCompiled;
+        }
+        if blocked {
+            return WhisperGpu::Blocked;
+        }
+        if gpu.is_none() {
+            return WhisperGpu::NoGpu;
+        }
+        return WhisperGpu::Allowed;
     }
     let Some(gpu) = gpu.filter(|gpu| gpu.vendor == GpuVendor::Nvidia) else {
         return WhisperGpu::NoNvidia;
@@ -174,16 +186,23 @@ fn whisper_gpu_for(
 
 pub fn whisper_gpu(gpu: Option<&GpuInfo>, blocked: bool) -> WhisperGpu {
     let nvidia = NVIDIA_ROWS.lock().clone();
-    whisper_gpu_for(cfg!(feature = "cuda"), cfg!(feature = "metal"), gpu, &nvidia, blocked)
+    whisper_gpu_for(
+        cfg!(feature = "cuda"),
+        cfg!(feature = "metal"),
+        cfg!(feature = "vulkan"),
+        gpu,
+        &nvidia,
+        blocked,
+    )
 }
 
 pub fn whisper_gpu_guarded() -> bool {
-    cfg!(feature = "cuda") && !cfg!(feature = "metal")
+    (cfg!(feature = "cuda") || cfg!(feature = "vulkan")) && !cfg!(feature = "metal")
 }
 
 pub fn decide_cuda_visibility(gate: WhisperGpu) {
     CUDA_VISIBILITY.call_once(|| {
-        if !whisper_gpu_guarded() || gate.allowed() {
+        if !cfg!(feature = "cuda") || !whisper_gpu_guarded() || gate.allowed() {
             return;
         }
         std::env::set_var(CUDA_VISIBLE_DEVICES, "-1");
@@ -390,7 +409,7 @@ pub fn parse_driver_major(text: &str) -> Option<u32> {
     major.parse().ok()
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", test))]
 fn smi_value(raw: &str) -> Option<String> {
     let value = raw.trim();
     if value.is_empty() || value.starts_with('[') || value.eq_ignore_ascii_case("n/a") {
@@ -400,7 +419,7 @@ fn smi_value(raw: &str) -> Option<String> {
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", test))]
 fn parse_nvidia_smi(text: &str, with_cc: bool) -> Vec<GpuInfo> {
     let fields = if with_cc { 3 } else { 2 };
     let mut out = Vec::new();
@@ -434,19 +453,20 @@ fn parse_nvidia_smi(text: &str, with_cc: bool) -> Vec<GpuInfo> {
     out
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", test))]
 fn pick_nvidia(rows: &[GpuInfo]) -> Option<&GpuInfo> {
     rows.iter().min_by_key(|row| row.cc().unwrap_or((0, 0)))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", test))]
 struct Adapter {
     vendor: GpuVendor,
     name: String,
     memory: u64,
+    driver: Option<String>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", test))]
 fn vendor_from_id(id: u32) -> GpuVendor {
     match id {
         VENDOR_NVIDIA => GpuVendor::Nvidia,
@@ -456,7 +476,7 @@ fn vendor_from_id(id: u32) -> GpuVendor {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", test))]
 fn vendor_rank(vendor: GpuVendor) -> u8 {
     match vendor {
         GpuVendor::Nvidia => 3,
@@ -466,11 +486,172 @@ fn vendor_rank(vendor: GpuVendor) -> u8 {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", test))]
 fn pick_adapter(adapters: &[Adapter]) -> Option<&Adapter> {
     adapters
         .iter()
         .max_by_key(|adapter| (vendor_rank(adapter.vendor), adapter.memory))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_hex_id(text: &str) -> Option<u32> {
+    let text = text.trim();
+    let digits = text
+        .strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))
+        .unwrap_or(text);
+    u32::from_str_radix(digits, 16).ok()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn pci_device_name(ids: &str, vendor: u32, device: u32) -> Option<String> {
+    let mut in_vendor = false;
+    for line in ids.lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some(entry) = line.strip_prefix('\t') {
+            if entry.starts_with('\t') || !in_vendor {
+                continue;
+            }
+            if let Some((id, name)) = entry.split_once("  ") {
+                if parse_hex_id(id) == Some(device) {
+                    return Some(name.trim().to_string());
+                }
+            }
+        } else if let Some((id, _)) = line.split_once("  ") {
+            in_vendor = parse_hex_id(id) == Some(vendor);
+        }
+    }
+    None
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn meminfo_total_mb(text: &str) -> Option<u64> {
+    let rest = text.lines().find_map(|line| line.strip_prefix("MemTotal:"))?;
+    let mut fields = rest.split_whitespace();
+    let kb = fields.next()?.parse::<u64>().ok()?;
+    match fields.next() {
+        Some("kB") => Some(kb / 1024),
+        _ => None,
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn is_drm_card(name: &str) -> bool {
+    name.strip_prefix("card")
+        .is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_sysfs_id(name: &str, text: &str) -> Option<u32> {
+    let id = parse_hex_id(text);
+    if id.is_none() {
+        tracing::warn!("graphics adapter {name} {text:?} is not a hex id");
+    }
+    id
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn adapter_from_sysfs(
+    vendor: &str,
+    device: &str,
+    class: &str,
+    vram_bytes: Option<&str>,
+    ids: Option<&str>,
+) -> Option<Adapter> {
+    if (parse_sysfs_id("class", class)? >> 16) != 0x03 {
+        return None;
+    }
+    let vendor = parse_sysfs_id("vendor", vendor)?;
+    let device = parse_sysfs_id("device", device)?;
+    let memory = vram_bytes
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let name = ids
+        .and_then(|ids| pci_device_name(ids, vendor, device))
+        .unwrap_or_else(|| format!("{vendor:04x} {device:04x}"));
+    Some(Adapter {
+        vendor: vendor_from_id(vendor),
+        name,
+        memory,
+        driver: None,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn read_sysfs(path: &Path) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Some(text.trim().to_string()),
+        Err(err) => {
+            tracing::warn!("{} could not be read: {err}", path.display());
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_vram_bytes(device: &Path) -> Option<String> {
+    let path = device.join("mem_info_vram_total");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Some(text.trim().to_string()),
+        Err(err) => {
+            tracing::debug!("{} could not be read: {err}", path.display());
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_pci_ids() -> Option<String> {
+    for path in ["/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids"] {
+        match std::fs::read_to_string(path) {
+            Ok(text) => return Some(text),
+            Err(err) => tracing::debug!("{path} could not be read: {err}"),
+        }
+    }
+    tracing::info!("no PCI id database found; graphics card names will show their ids");
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn sysfs_adapters() -> Vec<Adapter> {
+    let entries = match std::fs::read_dir("/sys/class/drm") {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::warn!("graphics adapters could not be listed: {err}");
+            return Vec::new();
+        }
+    };
+    let mut cards: Vec<std::path::PathBuf> = entries
+        .filter_map(|entry| match entry {
+            Ok(entry) => Some(entry.path()),
+            Err(err) => {
+                tracing::debug!("graphics adapter entry unavailable: {err}");
+                None
+            }
+        })
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_drm_card)
+        })
+        .collect();
+    cards.sort();
+    let ids = read_pci_ids();
+    cards
+        .iter()
+        .filter_map(|card| {
+            let device = card.join("device");
+            adapter_from_sysfs(
+                &read_sysfs(&device.join("vendor"))?,
+                &read_sysfs(&device.join("device"))?,
+                &read_sysfs(&device.join("class"))?,
+                read_vram_bytes(&device).as_deref(),
+                ids.as_deref(),
+            )
+        })
+        .collect()
 }
 
 #[cfg(windows)]
@@ -515,6 +696,7 @@ fn dxgi_adapters() -> Vec<Adapter> {
             vendor: vendor_from_id(desc.VendorId),
             name,
             memory: desc.DedicatedVideoMemory as u64,
+            driver: None,
         });
     }
     adapters
@@ -541,7 +723,12 @@ fn nvidia_smi_paths() -> Vec<std::path::PathBuf> {
     found
 }
 
-#[cfg(windows)]
+#[cfg(target_os = "linux")]
+fn nvidia_smi_paths() -> Vec<std::path::PathBuf> {
+    vec![std::path::PathBuf::from("nvidia-smi")]
+}
+
+#[cfg(any(windows, target_os = "linux"))]
 fn nvidia_smi() -> Vec<GpuInfo> {
     for exe in nvidia_smi_paths() {
         for (query, with_cc) in [
@@ -551,8 +738,10 @@ fn nvidia_smi() -> Vec<GpuInfo> {
             let mut command = std::process::Command::new(&exe);
             command
                 .arg(format!("--query-gpu={query}"))
-                .arg("--format=csv,noheader")
-                .env_remove(CUDA_VISIBLE_DEVICES);
+                .arg("--format=csv,noheader");
+            if cfg!(any(windows, feature = "cuda")) {
+                command.env_remove(CUDA_VISIBLE_DEVICES);
+            }
             match crate::sidecar::run_capture(command, NVIDIA_SMI_TIMEOUT) {
                 Ok(text) => {
                     let rows = parse_nvidia_smi(&text, with_cc);
@@ -571,8 +760,18 @@ fn nvidia_smi() -> Vec<GpuInfo> {
 }
 
 #[cfg(windows)]
+fn graphics_adapters() -> Vec<Adapter> {
+    dxgi_adapters()
+}
+
+#[cfg(target_os = "linux")]
+fn graphics_adapters() -> Vec<Adapter> {
+    sysfs_adapters()
+}
+
+#[cfg(any(windows, target_os = "linux"))]
 fn detect_gpu() -> (Option<GpuInfo>, Vec<GpuInfo>) {
-    let adapters = dxgi_adapters();
+    let adapters = graphics_adapters();
     let Some(best) = pick_adapter(&adapters) else {
         return (None, Vec::new());
     };
@@ -580,7 +779,7 @@ fn detect_gpu() -> (Option<GpuInfo>, Vec<GpuInfo>) {
         vendor: best.vendor,
         name: best.name.clone(),
         compute_cap: None,
-        driver_version: None,
+        driver_version: best.driver.clone(),
     };
     let rows = if best.vendor == GpuVendor::Nvidia {
         nvidia_smi()
@@ -593,7 +792,7 @@ fn detect_gpu() -> (Option<GpuInfo>, Vec<GpuInfo>) {
     (Some(info), rows)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 fn detect_gpu() -> (Option<GpuInfo>, Vec<GpuInfo>) {
     (None, Vec::new())
 }
@@ -601,13 +800,18 @@ fn detect_gpu() -> (Option<GpuInfo>, Vec<GpuInfo>) {
 fn log_gpu(gpu: Option<&GpuInfo>) {
     match gpu {
         Some(gpu) => {
-            let whisper = match gpu.cc() {
-                Some(cc) if whisper_cuda_supported(cc) => "covered",
-                Some(_) => "not covered",
-                None => "unknown",
+            let kernels = if cfg!(all(target_os = "linux", not(feature = "cuda"))) {
+                String::new()
+            } else {
+                let whisper = match gpu.cc() {
+                    Some(cc) if whisper_cuda_supported(cc) => "covered",
+                    Some(_) => "not covered",
+                    None => "unknown",
+                };
+                format!(", whisper CUDA kernels {whisper}")
             };
             tracing::info!(
-                "graphics card: {} ({:?}, compute capability {}, driver {}, whisper CUDA kernels {whisper})",
+                "graphics card: {} ({:?}, compute capability {}, driver {}{kernels})",
                 gpu.name,
                 gpu.vendor,
                 gpu.compute_cap.as_deref().unwrap_or("unknown"),
@@ -633,11 +837,18 @@ pub fn gpu_blocking(refresh: bool) -> Option<GpuInfo> {
     log_gpu(detected.as_ref());
     if rows.len() > 1 {
         for row in &rows {
+            let kernels = if cfg!(all(target_os = "linux", not(feature = "cuda"))) {
+                String::new()
+            } else {
+                format!(
+                    ", whisper CUDA kernels {}",
+                    if uncovered(row) { "not covered" } else { "covered or unknown" }
+                )
+            };
             tracing::info!(
-                "NVIDIA graphics card {}: compute capability {}, whisper CUDA kernels {}",
+                "NVIDIA graphics card {}: compute capability {}{kernels}",
                 row.name,
-                row.compute_cap.as_deref().unwrap_or("unknown"),
-                if uncovered(row) { "not covered" } else { "covered or unknown" }
+                row.compute_cap.as_deref().unwrap_or("unknown")
             );
         }
     }
@@ -691,7 +902,21 @@ fn total_ram_mb() -> u64 {
         .unwrap_or(0)
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
+fn total_ram_mb() -> u64 {
+    match std::fs::read_to_string("/proc/meminfo") {
+        Ok(text) => meminfo_total_mb(&text).unwrap_or_else(|| {
+            tracing::warn!("MemTotal is missing from /proc/meminfo");
+            0
+        }),
+        Err(err) => {
+            tracing::warn!("/proc/meminfo could not be read: {err}");
+            0
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn total_ram_mb() -> u64 {
     0
 }
@@ -854,23 +1079,24 @@ mod tests {
         let rtx5090_next = card(GpuVendor::Nvidia, Some("12.1"));
         let unknown = card(GpuVendor::Nvidia, None);
         let radeon = card(GpuVendor::Amd, None);
-        assert_eq!(whisper_gpu_for(true, false, Some(&rtx5070), &[], false), WhisperGpu::Allowed);
-        assert_eq!(whisper_gpu_for(true, false, Some(&gtx1080), &[], false), WhisperGpu::Allowed);
-        assert_eq!(whisper_gpu_for(true, false, Some(&unknown), &[], false), WhisperGpu::Allowed);
-        assert_eq!(whisper_gpu_for(true, false, Some(&v100), &[], false), WhisperGpu::Unsupported);
-        assert_eq!(whisper_gpu_for(true, false, Some(&rtx5090_next), &[], false), WhisperGpu::Unsupported);
-        assert_eq!(whisper_gpu_for(true, false, Some(&radeon), &[], false), WhisperGpu::NoNvidia);
-        assert_eq!(whisper_gpu_for(true, false, None, &[], false), WhisperGpu::NoNvidia);
-        assert_eq!(whisper_gpu_for(true, false, Some(&rtx5070), &[], true), WhisperGpu::Blocked);
-        assert_eq!(whisper_gpu_for(true, false, Some(&unknown), &[], true), WhisperGpu::Blocked);
-        assert_eq!(whisper_gpu_for(true, false, Some(&v100), &[], true), WhisperGpu::Unsupported);
-        assert_eq!(whisper_gpu_for(false, false, Some(&rtx5070), &[], false), WhisperGpu::NotCompiled);
-        assert_eq!(whisper_gpu_for(false, true, None, &[], false), WhisperGpu::Allowed);
-        assert_eq!(whisper_gpu_for(false, true, None, &[], true), WhisperGpu::Allowed);
+        assert_eq!(whisper_gpu_for(true, false, false, Some(&rtx5070), &[], false), WhisperGpu::Allowed);
+        assert_eq!(whisper_gpu_for(true, false, false, Some(&gtx1080), &[], false), WhisperGpu::Allowed);
+        assert_eq!(whisper_gpu_for(true, false, false, Some(&unknown), &[], false), WhisperGpu::Allowed);
+        assert_eq!(whisper_gpu_for(true, false, false, Some(&v100), &[], false), WhisperGpu::Unsupported);
+        assert_eq!(whisper_gpu_for(true, false, false, Some(&rtx5090_next), &[], false), WhisperGpu::Unsupported);
+        assert_eq!(whisper_gpu_for(true, false, false, Some(&radeon), &[], false), WhisperGpu::NoNvidia);
+        assert_eq!(whisper_gpu_for(true, false, false, None, &[], false), WhisperGpu::NoNvidia);
+        assert_eq!(whisper_gpu_for(true, false, false, Some(&rtx5070), &[], true), WhisperGpu::Blocked);
+        assert_eq!(whisper_gpu_for(true, false, false, Some(&unknown), &[], true), WhisperGpu::Blocked);
+        assert_eq!(whisper_gpu_for(true, false, false, Some(&v100), &[], true), WhisperGpu::Unsupported);
+        assert_eq!(whisper_gpu_for(false, false, false, Some(&rtx5070), &[], false), WhisperGpu::NotCompiled);
+        assert_eq!(whisper_gpu_for(false, true, false, None, &[], false), WhisperGpu::Allowed);
+        assert_eq!(whisper_gpu_for(false, true, false, None, &[], true), WhisperGpu::Allowed);
         assert!(WhisperGpu::Allowed.allowed());
         for gate in [
             WhisperGpu::NotCompiled,
             WhisperGpu::NoNvidia,
+            WhisperGpu::NoGpu,
             WhisperGpu::Unsupported,
             WhisperGpu::Blocked,
         ] {
@@ -880,21 +1106,97 @@ mod tests {
     }
 
     #[test]
+    fn vulkan_gate_allows_real_cards_and_reports_missing_cards() {
+        let amd = card(GpuVendor::Amd, None);
+        let old_nvidia = card(GpuVendor::Nvidia, Some("6.1"));
+        let uncovered_nvidia = card(GpuVendor::Nvidia, Some("7.0"));
+        let other = card(GpuVendor::Other, None);
+        assert_eq!(whisper_gpu_for(false, false, true, Some(&amd), &[], false), WhisperGpu::Allowed);
+        assert_eq!(whisper_gpu_for(false, false, true, Some(&old_nvidia), &[], false), WhisperGpu::Allowed);
+        assert_eq!(whisper_gpu_for(false, false, true, Some(&uncovered_nvidia), &[], false), WhisperGpu::Allowed);
+        assert_eq!(whisper_gpu_for(false, false, true, None, &[], false), WhisperGpu::NoGpu);
+        assert_eq!(whisper_gpu_for(false, false, true, None, &[], true), WhisperGpu::Blocked);
+        assert_eq!(whisper_gpu_for(false, false, true, Some(&other), &[], false), WhisperGpu::Allowed);
+        assert_eq!(whisper_gpu_for(false, false, true, Some(&other), &[], true), WhisperGpu::Blocked);
+        assert_eq!(whisper_gpu_for(false, false, true, Some(&amd), &[], true), WhisperGpu::Blocked);
+        assert_eq!(whisper_gpu_for(false, false, false, Some(&amd), &[], false), WhisperGpu::NotCompiled);
+        assert_eq!(whisper_gpu_for(false, true, true, None, &[], false), WhisperGpu::Allowed);
+        assert_eq!(whisper_gpu_for(true, false, true, Some(&amd), &[], false), WhisperGpu::NoNvidia);
+        assert_eq!(whisper_gpu_for(true, false, true, Some(&uncovered_nvidia), &[], false), WhisperGpu::Unsupported);
+    }
+
+    #[test]
+    fn pci_names_come_from_the_matching_vendor_section() {
+        let ids = "# comment\n1002  Advanced Micro Devices, Inc. [AMD/ATI]\n\t73fe  Navi 23 [Radeon RX 6600M]\n\t73ff  Navi 23 [Radeon RX 6600/6600 XT/6600M]\n\t\t1462 5021  MSI RX 6600XT MECH 2X\n1022  Advanced Micro Devices, Inc. [AMD]\n\t73ff  Wrong vendor\nC 03  Display controller\n\t00  VGA compatible controller\n";
+        assert_eq!(pci_device_name(ids, 0x1002, 0x73ff).as_deref(), Some("Navi 23 [Radeon RX 6600/6600 XT/6600M]"));
+        assert_eq!(pci_device_name(ids, 0x1002, 0x73fe).as_deref(), Some("Navi 23 [Radeon RX 6600M]"));
+        assert_eq!(pci_device_name(ids, 0x1022, 0x73ff).as_deref(), Some("Wrong vendor"));
+        assert_eq!(pci_device_name(ids, 0x10de, 0x73ff), None);
+        assert_eq!(pci_device_name(ids, 0x1002, 0x5021), None);
+        assert_eq!(pci_device_name(ids, 0x1002, 0x00), None);
+    }
+
+    #[test]
+    fn hex_ids_accept_sysfs_and_pci_ids_forms() {
+        assert_eq!(parse_hex_id("0x1002\n"), Some(0x1002));
+        assert_eq!(parse_hex_id("73ff"), Some(0x73FF));
+        assert_eq!(parse_hex_id("C 03"), None);
+        assert_eq!(parse_hex_id(""), None);
+    }
+
+    #[test]
+    fn sysfs_display_adapter_is_parsed_from_this_machine() {
+        let ids = "1002  Advanced Micro Devices, Inc. [AMD/ATI]\n\t73ff  Navi 23 [Radeon RX 6600/6600 XT/6600M]\n";
+        let adapter = adapter_from_sysfs("0x1002\n", "0x73ff\n", "0x030000\n", Some("8573157376\n"), Some(ids));
+        assert_eq!(adapter.as_ref().map(|a| a.vendor), Some(GpuVendor::Amd));
+        assert_eq!(adapter.as_ref().map(|a| a.name.as_str()), Some("Navi 23 [Radeon RX 6600/6600 XT/6600M]"));
+        assert_eq!(adapter.as_ref().map(|a| a.memory), Some(8_573_157_376));
+    }
+
+    #[test]
+    fn sysfs_adapter_rejects_non_display_and_falls_back_to_ids() {
+        assert!(adapter_from_sysfs("0x1002", "0x73ff", "0x040300", None, None).is_none());
+        assert!(adapter_from_sysfs("zz", "0x73ff", "0x030000", None, None).is_none());
+        assert!(adapter_from_sysfs("0x1002", "", "0x030000", None, None).is_none());
+        let fallback = adapter_from_sysfs("0x10de", "0x2684", "0x030200", Some("unknown"), None);
+        assert_eq!(fallback.as_ref().map(|a| a.name.as_str()), Some("10de 2684"));
+        assert_eq!(fallback.as_ref().map(|a| a.vendor), Some(GpuVendor::Nvidia));
+        assert_eq!(fallback.as_ref().map(|a| a.memory), Some(0));
+    }
+
+    #[test]
+    fn drm_card_entries_skip_connectors_and_render_nodes() {
+        assert!(is_drm_card("card0"));
+        assert!(is_drm_card("card1"));
+        assert!(!is_drm_card("card1-DP-1"));
+        assert!(!is_drm_card("card"));
+        assert!(!is_drm_card("renderD128"));
+        assert!(!is_drm_card("version"));
+    }
+
+    #[test]
+    fn meminfo_total_is_converted_to_megabytes() {
+        assert_eq!(meminfo_total_mb("MemTotal:       31706660 kB\nMemFree:         1000 kB\n"), Some(30963));
+        assert_eq!(meminfo_total_mb("MemFree:  1000 kB\n"), None);
+        assert_eq!(meminfo_total_mb("MemTotal: 12 MB\n"), None);
+    }
+
+    #[test]
     fn whisper_gpu_gate_requires_every_nvidia_card_to_be_covered() {
         let primary = card(GpuVendor::Nvidia, Some("7.5"));
         let covered = [card(GpuVendor::Nvidia, Some("7.5")), card(GpuVendor::Nvidia, Some("12.0"))];
         let mixed = [card(GpuVendor::Nvidia, Some("7.5")), card(GpuVendor::Nvidia, Some("8.0"))];
         let unknown_and_covered = [card(GpuVendor::Nvidia, Some("8.9")), card(GpuVendor::Nvidia, None)];
         let unknown_and_uncovered = [card(GpuVendor::Nvidia, None), card(GpuVendor::Nvidia, Some("7.0"))];
-        assert_eq!(whisper_gpu_for(true, false, Some(&primary), &covered, false), WhisperGpu::Allowed);
-        assert_eq!(whisper_gpu_for(true, false, Some(&primary), &mixed, false), WhisperGpu::Unsupported);
-        assert_eq!(whisper_gpu_for(true, false, Some(&primary), &unknown_and_covered, false), WhisperGpu::Allowed);
-        assert_eq!(whisper_gpu_for(true, false, Some(&primary), &unknown_and_uncovered, false), WhisperGpu::Unsupported);
-        assert_eq!(whisper_gpu_for(true, false, Some(&primary), &mixed, true), WhisperGpu::Unsupported);
-        assert_eq!(whisper_gpu_for(true, false, Some(&primary), &covered, true), WhisperGpu::Blocked);
+        assert_eq!(whisper_gpu_for(true, false, false, Some(&primary), &covered, false), WhisperGpu::Allowed);
+        assert_eq!(whisper_gpu_for(true, false, false, Some(&primary), &mixed, false), WhisperGpu::Unsupported);
+        assert_eq!(whisper_gpu_for(true, false, false, Some(&primary), &unknown_and_covered, false), WhisperGpu::Allowed);
+        assert_eq!(whisper_gpu_for(true, false, false, Some(&primary), &unknown_and_uncovered, false), WhisperGpu::Unsupported);
+        assert_eq!(whisper_gpu_for(true, false, false, Some(&primary), &mixed, true), WhisperGpu::Unsupported);
+        assert_eq!(whisper_gpu_for(true, false, false, Some(&primary), &covered, true), WhisperGpu::Blocked);
         let radeon = card(GpuVendor::Amd, None);
-        assert_eq!(whisper_gpu_for(true, false, Some(&radeon), &mixed, false), WhisperGpu::NoNvidia);
-        assert_eq!(whisper_gpu_for(false, true, None, &mixed, false), WhisperGpu::Allowed);
+        assert_eq!(whisper_gpu_for(true, false, false, Some(&radeon), &mixed, false), WhisperGpu::NoNvidia);
+        assert_eq!(whisper_gpu_for(false, true, false, None, &mixed, false), WhisperGpu::Allowed);
     }
 
     #[test]
@@ -903,6 +1205,7 @@ mod tests {
             (WhisperGpu::Allowed, "\"allowed\""),
             (WhisperGpu::NotCompiled, "\"not_compiled\""),
             (WhisperGpu::NoNvidia, "\"no_nvidia\""),
+            (WhisperGpu::NoGpu, "\"no_gpu\""),
             (WhisperGpu::Unsupported, "\"unsupported\""),
             (WhisperGpu::Blocked, "\"blocked\""),
         ];
@@ -1039,19 +1342,19 @@ mod tests {
         assert_ne!(first, gpu.fingerprint());
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn adapter_pick_prefers_discrete_vendor_then_memory() {
         let adapters = vec![
-            Adapter { vendor: GpuVendor::Intel, name: "Intel UHD".to_string(), memory: 128 },
-            Adapter { vendor: GpuVendor::Nvidia, name: "RTX 4060 Laptop".to_string(), memory: 8192 },
-            Adapter { vendor: GpuVendor::Amd, name: "Radeon".to_string(), memory: 16384 },
+            Adapter { vendor: GpuVendor::Intel, name: "Intel UHD".to_string(), memory: 128, driver: None },
+            Adapter { vendor: GpuVendor::Nvidia, name: "RTX 4060 Laptop".to_string(), memory: 8192, driver: None },
+            Adapter { vendor: GpuVendor::Amd, name: "Radeon".to_string(), memory: 16384, driver: None },
         ];
         assert_eq!(pick_adapter(&adapters).map(|a| a.name.as_str()), Some("RTX 4060 Laptop"));
         let amd_intel = vec![
-            Adapter { vendor: GpuVendor::Amd, name: "Radeon 780M".to_string(), memory: 512 },
-            Adapter { vendor: GpuVendor::Amd, name: "Radeon RX 7800".to_string(), memory: 16384 },
-            Adapter { vendor: GpuVendor::Intel, name: "Arc".to_string(), memory: 32768 },
+            Adapter { vendor: GpuVendor::Amd, name: "Radeon 780M".to_string(), memory: 512, driver: None },
+            Adapter { vendor: GpuVendor::Amd, name: "Radeon RX 7800".to_string(), memory: 16384, driver: None },
+            Adapter { vendor: GpuVendor::Intel, name: "Arc".to_string(), memory: 32768, driver: None },
         ];
         assert_eq!(pick_adapter(&amd_intel).map(|a| a.name.as_str()), Some("Radeon RX 7800"));
         assert!(pick_adapter(&[]).is_none());

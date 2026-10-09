@@ -44,6 +44,11 @@ pub fn emit_error(app: &AppHandle, stage: &str, code: &str, message: &str) {
     emit_event(app, stage, code, message, json!({}), "error");
 }
 
+#[cfg(target_os = "linux")]
+pub fn emit_error_with_params(app: &AppHandle, stage: &str, code: &str, message: &str, params: Value) {
+    emit_event(app, stage, code, message, params, "error");
+}
+
 fn emit_issue(app: &AppHandle, stage: &str, issue: Issue) {
     emit_event(app, stage, issue.code, &issue.message, issue.params, "error");
 }
@@ -511,6 +516,8 @@ async fn run_pipeline(
             tracing::warn!("injection failed: {err}");
             let code = if paste_needs_accessibility() {
                 "accessibility_needed"
+            } else if paste_input_denied() {
+                "input_denied"
             } else {
                 "inject_failed"
             };
@@ -675,7 +682,11 @@ fn inject_block_hint() -> &'static str {
     {
         "Grant Accessibility permission in System Settings to paste automatically; the text is on the clipboard."
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        "On Linux, allow Synapse to control the keyboard when the system asks; the text is on the clipboard."
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         "Elevated windows (run as administrator) block pasting; the text is on the clipboard."
     }
@@ -687,6 +698,17 @@ fn paste_needs_accessibility() -> bool {
         !crate::inject::accessibility_trusted()
     }
     #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+fn paste_input_denied() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        crate::inject::take_input_denied()
+    }
+    #[cfg(not(target_os = "linux"))]
     {
         false
     }

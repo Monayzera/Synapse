@@ -89,7 +89,8 @@ export type UpdateNoticeKind =
   | "check_failed"
   | "postponed"
   | "busy"
-  | "relocate";
+  | "relocate"
+  | "restart_needed";
 
 export interface UpdateNotice {
   kind: UpdateNoticeKind;
@@ -181,7 +182,7 @@ export interface GpuInfo {
   driver_version: string | null;
 }
 
-export type WhisperGpu = "allowed" | "not_compiled" | "no_nvidia" | "unsupported" | "blocked";
+export type WhisperGpu = "allowed" | "not_compiled" | "no_nvidia" | "unsupported" | "blocked" | "no_gpu";
 
 export interface HardwareInfo {
   total_ram_mb: number;

@@ -17,7 +17,7 @@ pub fn write_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_file_name(format!("{name}.tmp-{}-{seq}", std::process::id()));
 
     {
-        let mut file = std::fs::File::create(&tmp)?;
+        let mut file = create_tmp(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
     }
@@ -47,6 +47,33 @@ pub fn write_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+pub fn restrict_existing(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn create_tmp(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn create_tmp(path: &Path) -> io::Result<std::fs::File> {
+    std::fs::File::create(path)
+}
+
 #[cfg(windows)]
 fn fsync_dir(dir: &Path) -> io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
@@ -62,4 +89,56 @@ fn fsync_dir(dir: &Path) -> io::Result<()> {
 fn fsync_dir(dir: &Path) -> io::Result<()> {
     let dir = std::fs::File::open(dir)?;
     dir.sync_all()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::{create_tmp, restrict_existing, write_durable};
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn written_files_are_private() {
+        let dir = std::env::temp_dir().join(format!("synapse-atomic-io-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        write_durable(&path, b"{}").expect("file written");
+        let mode = std::fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn preexisting_temp_file_becomes_private() {
+        let dir = std::env::temp_dir().join(format!("synapse-atomic-io-tmp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir created");
+        let path = dir.join("settings.json.tmp");
+        std::fs::write(&path, b"stale").expect("file written");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("mode set");
+        drop(create_tmp(&path).expect("temp file opened"));
+        let mode = std::fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn existing_file_becomes_private() {
+        let dir =
+            std::env::temp_dir().join(format!("synapse-atomic-io-restrict-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir created");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, b"{}").expect("file written");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("mode set");
+        restrict_existing(&path).expect("file restricted");
+        let mode = std::fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn missing_file_restriction_is_ok() {
+        let dir =
+            std::env::temp_dir().join(format!("synapse-atomic-io-absent-{}", std::process::id()));
+        let path = dir.join("settings.bak");
+        assert!(restrict_existing(&path).is_ok());
+        assert!(!path.exists());
+    }
 }

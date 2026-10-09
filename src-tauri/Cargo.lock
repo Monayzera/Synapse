@@ -99,6 +99,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ashpd"
+version = "0.13.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb8421aaa9644a5faf26735f258b669b15f063313ef8f8e2bdb28912a1a6f111"
+dependencies = [
+ "enumflags2",
+ "futures-util",
+ "getrandom 0.4.2",
+ "serde",
+ "serde_repr",
+ "tokio",
+ "zbus",
+]
+
+[[package]]
 name = "async-broadcast"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4448,12 +4463,16 @@ version = "1.0.3"
 dependencies = [
  "anyhow",
  "arboard",
+ "ashpd",
  "base64 0.22.1",
  "block2",
  "cpal",
  "enigo",
  "flate2",
  "futures-util",
+ "gdk",
+ "gtk",
+ "libc",
  "minisign-verify",
  "objc2",
  "ort",
@@ -4479,6 +4498,7 @@ dependencies = [
  "tracing-subscriber",
  "whisper-rs",
  "windows 0.62.2",
+ "x11rb",
  "zip",
 ]
 
@@ -5096,6 +5116,7 @@ dependencies = [
  "signal-hook-registry",
  "socket2",
  "tokio-macros",
+ "tracing",
  "windows-sys 0.61.2",
 ]
 
@@ -5910,6 +5931,7 @@ version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2088172d00f936c348d6a72f488dc2660ab3f507263a195df308a3c2383229f6"
 dependencies = [
+ "libc",
  "tracing",
  "whisper-rs-sys",
 ]
@@ -6712,6 +6734,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_repr",
+ "tokio",
  "tracing",
  "uds_windows",
  "uuid",

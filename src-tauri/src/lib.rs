@@ -15,14 +15,20 @@ mod hotkey;
 mod llama_setup;
 #[cfg(windows)]
 mod inputhook;
+#[cfg(target_os = "linux")]
+mod inputhook_linux;
 #[cfg(target_os = "macos")]
 mod inputhook_mac;
 mod inject;
+#[cfg(target_os = "linux")]
+mod linux_portal;
 mod models;
 mod permissions;
 mod pipeline;
 #[cfg(windows)]
 mod power;
+#[cfg(target_os = "linux")]
+mod power_linux;
 mod services;
 mod sidecar;
 mod sound;
@@ -58,6 +64,8 @@ const WINDOW_RETRIES: u32 = 8;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    let x11_forced = force_x11_backend();
     install_panic_hook();
 
     let context = tauri::generate_context!();
@@ -69,14 +77,35 @@ pub fn run() {
     let guard = instance_guard(&identifier);
     #[cfg(windows)]
     let primary = guard.primary;
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     let primary = true;
 
     let local_dir =
         app_local_dir(&identifier).unwrap_or_else(|| std::env::temp_dir().join("Synapse"));
+    #[cfg(target_os = "linux")]
+    let instance_lock = acquire_instance_lock(&local_dir);
+    #[cfg(target_os = "linux")]
+    let primary = !matches!(instance_lock, Ok(None));
     let log_dir = local_dir.join("logs");
     init_tracing(&log_dir, primary);
     log_banner(&version, autostart_launch);
+    #[cfg(target_os = "linux")]
+    {
+        if x11_forced {
+            tracing::info!("GDK limited to x11 (Wayland session with Xwayland)");
+        } else {
+            tracing::info!("GDK_BACKEND left unchanged (needs WAYLAND_DISPLAY and DISPLAY)");
+        }
+        match &instance_lock {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                tracing::info!("another Synapse instance holds the lock; this launch is secondary")
+            }
+            Err(err) => {
+                tracing::warn!("instance lock unavailable, treating this launch as primary: {err}")
+            }
+        }
+    }
     #[cfg(windows)]
     {
         if let Some(note) = &guard.note {
@@ -91,6 +120,12 @@ pub fn run() {
 
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            #[cfg(target_os = "linux")]
+            if argv.iter().any(|arg| arg == "--toggle") {
+                tracing::info!("second launch forwarded ({argv:?}); toggling dictation");
+                inputhook_linux::toggle_from_cli(app);
+                return;
+            }
             tracing::info!("second launch forwarded ({argv:?}); showing the widget");
             show_window(app, "widget");
         }))
@@ -152,7 +187,13 @@ pub fn run() {
             commands::open_settings,
             commands::open_window,
             commands::hide_window,
+            #[cfg(target_os = "linux")]
+            commands::widget_monitor,
+            #[cfg(target_os = "linux")]
+            commands::widget_resize,
             commands::open_privacy_settings,
+            #[cfg(target_os = "linux")]
+            commands::retry_hotkey,
             commands::add_custom_model,
             commands::delete_model,
             commands::setup_llama_auto,
@@ -252,6 +293,7 @@ fn setup(app: &mut tauri::App, autostart_launch: bool, log_dir: PathBuf, guard_d
         }
     };
 
+    #[cfg(not(target_os = "linux"))]
     prepend_dll_dirs(&resource_dir);
 
     let notify_handle = handle.clone();
@@ -334,6 +376,9 @@ fn setup(app: &mut tauri::App, autostart_launch: bool, log_dir: PathBuf, guard_d
 
     build_windows(app);
 
+    #[cfg(target_os = "linux")]
+    prepare_linux_widget(&handle);
+
     #[cfg(windows)]
     inputhook::start(handle.clone());
 
@@ -342,6 +387,12 @@ fn setup(app: &mut tauri::App, autostart_launch: bool, log_dir: PathBuf, guard_d
 
     #[cfg(target_os = "macos")]
     inputhook_mac::start(handle.clone());
+
+    #[cfg(target_os = "linux")]
+    {
+        inputhook_linux::start(handle.clone());
+        power_linux::start(handle.clone());
+    }
 
     updater::init(&handle);
 
@@ -353,6 +404,16 @@ fn setup(app: &mut tauri::App, autostart_launch: bool, log_dir: PathBuf, guard_d
     let ready_state = state.clone();
     tauri::async_runtime::spawn(async move {
         for _ in 0..50 {
+            #[cfg(target_os = "linux")]
+            let ready = on_main_thread(&pos_handle, |app| {
+                app.get_webview_window("widget")
+                    .and_then(|w| w.available_monitors().ok())
+                    .map(|m| !m.is_empty())
+                    .unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false);
+            #[cfg(not(target_os = "linux"))]
             let ready = pos_handle
                 .get_webview_window("widget")
                 .and_then(|w| w.available_monitors().ok())
@@ -363,6 +424,9 @@ fn setup(app: &mut tauri::App, autostart_launch: bool, log_dir: PathBuf, guard_d
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
+        #[cfg(target_os = "linux")]
+        let _ = on_main_thread(&pos_handle, position_widget).await;
+        #[cfg(not(target_os = "linux"))]
         position_widget(&pos_handle);
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
         ready_state.widget_ready.store(true, Ordering::Release);
@@ -387,6 +451,17 @@ fn build_window(
 fn window_created(handle: &tauri::AppHandle, label: &str) {
     tracing::info!("window '{label}' created");
     if label == "widget" {
+        #[cfg(target_os = "linux")]
+        {
+            let target = handle.clone();
+            if let Err(err) = handle.run_on_main_thread(move || {
+                prepare_linux_widget(&target);
+                position_widget(&target);
+            }) {
+                tracing::warn!("widget position not applied: {err}");
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
         position_widget(handle);
     }
     #[cfg(windows)]
@@ -489,6 +564,102 @@ fn show_window(app: &tauri::AppHandle, label: &str) {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) async fn on_main_thread<T, F>(app: &tauri::AppHandle, job: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&tauri::AppHandle) -> T + Send + 'static,
+{
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let target = app.clone();
+    if let Err(err) = app.run_on_main_thread(move || {
+        let _ = sender.send(job(&target));
+    }) {
+        tracing::warn!("main thread task not dispatched: {err}");
+        return None;
+    }
+    match receiver.await {
+        Ok(value) => Some(value),
+        Err(err) => {
+            tracing::warn!("main thread task dropped: {err}");
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_linux_widget(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window("widget") else {
+        return;
+    };
+    let size = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|config| config.label == "widget")
+        .map(|config| (config.width, config.height));
+    if let Some((width, height)) = size {
+        if let Err(err) = set_widget_size(&window, width, height) {
+            tracing::warn!("widget size not applied: {err}");
+        }
+    }
+    watch_widget_hover(&window);
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn set_widget_size(
+    window: &tauri::WebviewWindow,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    use gtk::prelude::{GtkWindowExt, WidgetExt};
+    if !width.is_finite() || !height.is_finite() || width < 1.0 || height < 1.0 {
+        return Err(format!("invalid widget size {width}x{height}"));
+    }
+    let gtk_window = window
+        .gtk_window()
+        .map_err(|err| format!("widget window unavailable: {err}"))?;
+    let (width, height) = (width.round() as i32, height.round() as i32);
+    gtk_window.set_size_request(width, height);
+    gtk_window.resize(width, height);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn watch_widget_hover(window: &tauri::WebviewWindow) {
+    use gtk::prelude::{WidgetExt, WidgetExtManual};
+    let gtk_window = match window.gtk_window() {
+        Ok(gtk_window) => gtk_window,
+        Err(err) => {
+            tracing::warn!("widget hover tracking unavailable: {err}");
+            return;
+        }
+    };
+    gtk_window.add_events(gdk::EventMask::ENTER_NOTIFY_MASK | gdk::EventMask::LEAVE_NOTIFY_MASK);
+    let enter_app = window.app_handle().clone();
+    gtk_window.connect_enter_notify_event(move |_, event| {
+        if event.detail() != gdk::NotifyType::Inferior {
+            emit_widget_hover(&enter_app, true);
+        }
+        gtk::glib::Propagation::Proceed
+    });
+    let leave_app = window.app_handle().clone();
+    gtk_window.connect_leave_notify_event(move |_, event| {
+        if event.detail() != gdk::NotifyType::Inferior {
+            emit_widget_hover(&leave_app, false);
+        }
+        gtk::glib::Propagation::Proceed
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn emit_widget_hover(app: &tauri::AppHandle, hovered: bool) {
+    if let Err(err) = app.emit_to("widget", "widget-hover", hovered) {
+        tracing::warn!("widget hover event not delivered: {err}");
+    }
+}
+
 fn position_widget(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("widget") {
         if let Some(state) = app.try_state::<SharedState>() {
@@ -500,21 +671,45 @@ fn position_widget(app: &tauri::AppHandle) {
             }
         }
         if let Ok(Some(monitor)) = window.current_monitor() {
-            let monitor_size = monitor.size();
-            let monitor_pos = monitor.position();
             let scale = monitor.scale_factor();
+            let (area_pos, area_size, bottom_reserve) = usable_area(&monitor, scale);
             let widget_size = window.outer_size().unwrap_or(tauri::PhysicalSize {
                 width: (268.0 * scale) as u32,
                 height: (40.0 * scale) as u32,
             });
             let margin = (24.0 * scale) as i32;
-            let taskbar = (taskbar_reserve() * scale) as i32;
-            let x = monitor_pos.x + monitor_size.width as i32 - widget_size.width as i32 - margin;
+            let x = area_pos.x + area_size.width as i32 - widget_size.width as i32 - margin;
             let y =
-                monitor_pos.y + monitor_size.height as i32 - widget_size.height as i32 - taskbar;
+                area_pos.y + area_size.height as i32 - widget_size.height as i32 - bottom_reserve;
             let _ = window.set_position(tauri::PhysicalPosition { x, y });
         }
     }
+}
+
+fn usable_area(
+    monitor: &tauri::Monitor,
+    scale: f64,
+) -> (tauri::PhysicalPosition<i32>, tauri::PhysicalSize<u32>, i32) {
+    #[cfg(target_os = "linux")]
+    {
+        let work = monitor.work_area();
+        let pos = monitor.position();
+        let size = monitor.size();
+        let inside = work.size.width > 0
+            && work.size.height > 0
+            && work.position.x >= pos.x
+            && work.position.y >= pos.y
+            && work.position.x + work.size.width as i32 <= pos.x + size.width as i32
+            && work.position.y + work.size.height as i32 <= pos.y + size.height as i32;
+        if inside {
+            return (work.position, work.size, (24.0 * scale) as i32);
+        }
+    }
+    (
+        *monitor.position(),
+        *monitor.size(),
+        (taskbar_reserve() * scale) as i32,
+    )
 }
 
 fn taskbar_reserve() -> f64 {
@@ -569,15 +764,13 @@ fn clamp_into_view(window: &tauri::WebviewWindow, x: i32, y: i32) -> Option<(i32
     }
 
     let monitor = &monitors[best_idx?];
-    let pos = monitor.position();
-    let dim = monitor.size();
     let scale = monitor.scale_factor();
+    let (area_pos, area_size, bottom_reserve) = usable_area(monitor, scale);
     let margin = (24.0 * scale) as i32;
-    let taskbar = (taskbar_reserve() * scale) as i32;
-    let min_x = pos.x + margin;
-    let max_x = (pos.x + dim.width as i32 - w - margin).max(min_x);
-    let min_y = pos.y + margin;
-    let max_y = (pos.y + dim.height as i32 - h - taskbar).max(min_y);
+    let min_x = area_pos.x + margin;
+    let max_x = (area_pos.x + area_size.width as i32 - w - margin).max(min_x);
+    let min_y = area_pos.y + margin;
+    let max_y = (area_pos.y + area_size.height as i32 - h - bottom_reserve).max(min_y);
     Some((x.clamp(min_x, max_x), y.clamp(min_y, max_y)))
 }
 
@@ -748,9 +941,9 @@ fn adopt_legacy_root(own: &Path, legacy_identifier: &str) -> Option<PathBuf> {
 }
 
 fn preferred_base_dir(handle: &tauri::AppHandle) -> Option<PathBuf> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let base = handle.path().data_dir();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let base = handle.path().document_dir();
     base.ok().map(|dir| dir.join("Synapse"))
 }
@@ -1068,6 +1261,7 @@ fn move_if_absent(from: &Path, to: &Path) {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn prepend_dll_dirs(resource_dir: &Path) {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let candidates = [
@@ -1170,9 +1364,12 @@ fn app_local_dir(identifier: &str) -> Option<PathBuf> {
     let base = std::env::var_os("HOME")
         .map(|home| PathBuf::from(home).join("Library").join("Application Support"));
     #[cfg(not(any(windows, target_os = "macos")))]
-    let base = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).or_else(|| {
-        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share"))
-    });
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share"))
+        });
     base.map(|dir| dir.join(identifier))
 }
 
@@ -1211,8 +1408,13 @@ fn open_log(dir: &Path, primary: bool) -> Option<(std::fs::File, PathBuf)> {
 }
 
 fn init_tracing(log_dir: &Path, primary: bool) {
+    let default_filter = if cfg!(target_os = "linux") {
+        "info,ort=warn,zbus=error"
+    } else {
+        "info,ort=warn"
+    };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,ort=warn"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
     let opened = open_log(log_dir, primary).or_else(|| {
         open_log(&std::env::temp_dir().join("Synapse").join("logs"), primary)
     });
@@ -1231,6 +1433,40 @@ fn init_tracing(log_dir: &Path, primary: bool) {
                 .with_env_filter(filter)
                 .with_target(false)
                 .try_init();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn force_x11_backend() -> bool {
+    let set = |name: &str| std::env::var_os(name).is_some_and(|value| !value.is_empty());
+    let wayland = set("WAYLAND_DISPLAY");
+    let forced = wayland && set("DISPLAY");
+    if forced {
+        std::env::remove_var("GDK_BACKEND");
+        gdk::set_allowed_backends("x11");
+    } else if wayland {
+        std::env::remove_var("GDK_BACKEND");
+    }
+    forced
+}
+
+#[cfg(target_os = "linux")]
+fn acquire_instance_lock(dir: &Path) -> Result<Option<std::fs::File>, String> {
+    std::fs::create_dir_all(dir)
+        .map_err(|err| format!("{} could not be created: {err}", dir.display()))?;
+    let path = dir.join("synapse.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|err| format!("{} could not be opened: {err}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(err)) => {
+            Err(format!("{} could not be locked: {err}", path.display()))
         }
     }
 }

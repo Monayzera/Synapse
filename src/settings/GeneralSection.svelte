@@ -5,12 +5,16 @@
   import type { RecordMode, Settings } from "../lib/types";
   import Switch from "./Switch.svelte";
   import Segmented from "./Segmented.svelte";
-  import { app, commit, describeError } from "./store.svelte";
+  import { app, commit, describeError, errorText } from "./store.svelte";
 
   let { s }: { s: Settings } = $props();
 
   const isMac =
     typeof navigator !== "undefined" && /Mac/i.test(navigator.platform || navigator.userAgent);
+  const isLinux =
+    typeof navigator !== "undefined" &&
+    /Linux/i.test(navigator.userAgent) &&
+    !/Android/i.test(navigator.userAgent);
 
   const SPEECH_LANGS = ["auto", "pt", "en", "es", "fr", "de", "it", "ja", "zh", "ru", "ko"];
 
@@ -35,7 +39,7 @@
           case "MouseForward":
             return t("key.mouseForward");
           case "Super":
-            return isMac ? "Cmd" : "Win";
+            return isMac ? "Cmd" : isLinux ? "Super" : "Win";
           case "Space":
             return t("key.space");
           case "Up":
@@ -114,7 +118,12 @@
 
   function setHotkey(accel: string) {
     capturing = false;
-    if (accel && accel !== s.hotkey_ptt) void commit({ hotkey_ptt: accel });
+    if (!accel) return;
+    if (accel !== s.hotkey_ptt) {
+      void commit({ hotkey_ptt: accel });
+      return;
+    }
+    if (isLinux && app.status?.hotkey_ready === false) api.retryHotkey().catch(() => {});
   }
 
   function onKey(e: KeyboardEvent) {
@@ -134,7 +143,7 @@
 
   function onMouse(e: MouseEvent) {
     if (!capturing) return;
-    const token = isMac ? null : mouseToken(e.button);
+    const token = isMac || isLinux ? null : mouseToken(e.button);
     if (!token) {
       if (e.button === 0) {
         const target = e.target as HTMLElement | null;
@@ -175,7 +184,14 @@
   }
 
   const autostartSub = $derived.by(() => {
-    if (autostartError) return { text: t("gen.autostartFailed"), err: true, title: autostartError };
+    const failure = autostartError || (isLinux ? app.autostart?.error : null);
+    if (failure) {
+      return {
+        text: t("gen.autostartFailed"),
+        err: true,
+        title: isLinux ? errorText(failure, failure) : failure,
+      };
+    }
     if (s.autostart && app.autostart?.disabled_by_windows) {
       return { text: t("gen.disabledByWindows"), err: false, title: "" };
     }
@@ -195,7 +211,7 @@
     <div class="item-control hotkey">
       <div class="keys" class:capturing aria-live="polite">
         {#if capturing}
-          <span class="keys-prompt">{isMac ? t("gen.pressKeys") : t("gen.pressKeysMouse")}</span>
+          <span class="keys-prompt">{isMac || isLinux ? t("gen.pressKeys") : t("gen.pressKeysMouse")}</span>
         {:else if keyParts.length === 0}
           <span class="keys-prompt">{t("gen.none")}</span>
         {:else}
@@ -214,6 +230,11 @@
       </button>
     </div>
   </div>
+  {#if isLinux}
+    <div class="item">
+      <span class="field-hint">{t("gen.hotkeyLinuxHint")}</span>
+    </div>
+  {/if}
   <div class="item">
     <span class="item-label">{t("gen.mode")}</span>
     <Segmented
@@ -267,7 +288,7 @@
 
 <div class="group">
   <Switch
-    label={isMac ? t("gen.startMac") : t("gen.startWin")}
+    label={isMac ? t("gen.startMac") : isLinux ? t("gen.startLinux") : t("gen.startWin")}
     checked={s.autostart}
     disabled={autostartBusy}
     sub={autostartSub.text}

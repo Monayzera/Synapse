@@ -23,6 +23,11 @@
   const PILL_MAX = 440;
   const WINDOW_EXTRA = 170;
   const WINDOW_HEIGHT = 40;
+  const isLinux =
+    typeof navigator !== "undefined" &&
+    /Linux/i.test(navigator.userAgent) &&
+    !/Android/i.test(navigator.userAgent);
+  if (isLinux) document.documentElement.dataset.platform = "linux";
 
   const INITIAL_STATUS: StatusPayload = {
     status: "idle",
@@ -124,11 +129,19 @@
 
   const idleText = $derived(idle.text);
 
+  function errorHoldMs(text: string): number {
+    return isLinux ? Math.max(7000, text.length * 80) : 7000;
+  }
+
   function showFlash(text: string, kind: "ok" | "err", holdMs?: number) {
     if (!text) return;
-    flash = { text: text.length > 220 ? text.slice(0, 219) + "…" : text, kind };
+    const shown = text.length > 220 ? text.slice(0, 219) + "…" : text;
+    flash = { text: shown, kind };
     clearTimeout(flashTimer);
-    flashTimer = setTimeout(() => (flash = null), holdMs ?? (kind === "err" ? 7000 : 2600));
+    flashTimer = setTimeout(
+      () => (flash = null),
+      holdMs ?? (kind === "err" ? errorHoldMs(shown) : 2600),
+    );
   }
 
   function showUpdateNotice(payload: UpdateNotice | null | undefined) {
@@ -163,7 +176,10 @@
         showFlash(t("w.updBusy"), "err");
         break;
       case "relocate":
-        showFlash(t("w.updMove"), "err");
+        showFlash(t(isLinux ? "w.updMoveLinux" : "w.updMove"), "err");
+        break;
+      case "restart_needed":
+        showFlash(t("w.updRestart"), isLinux ? "ok" : "err", 7000);
         break;
     }
   }
@@ -174,24 +190,32 @@
     return idleText;
   });
 
+  function queryMonitor() {
+    return isLinux ? api.widgetMonitor().catch(() => null) : currentMonitor();
+  }
+
   async function resizeWindowTo(targetWin: number, anchorRight: boolean) {
     const win = getCurrentWindow();
     const [pos, size, scale, mon] = await Promise.all([
       win.outerPosition(),
       win.outerSize(),
       win.scaleFactor(),
-      currentMonitor(),
+      queryMonitor(),
     ]);
     const delta = targetWin - size.width / scale;
     if (Math.abs(delta) < 2) return;
-    await win.setResizable(true);
-    await win.setSize(new LogicalSize(targetWin, WINDOW_HEIGHT));
+    if (isLinux) {
+      await api.widgetResize(targetWin, WINDOW_HEIGHT);
+    } else {
+      await win.setResizable(true);
+      await win.setSize(new LogicalSize(targetWin, WINDOW_HEIGHT));
+    }
     if (anchorRight) {
       let nx = pos.x / scale - delta;
       if (mon) nx = Math.max(mon.position.x / scale, nx);
       await win.setPosition(new LogicalPosition(nx, pos.y / scale));
     }
-    await win.setResizable(false);
+    if (!isLinux) await win.setResizable(false);
   }
 
   async function applyWindowWidth(targetPill: number) {
@@ -250,7 +274,7 @@
         win.outerPosition(),
         win.outerSize(),
         win.scaleFactor(),
-        currentMonitor(),
+        queryMonitor(),
       ]);
       if (!mon) return;
       const pillRightX = pos.x + size.width - PILL_EDGE * scale;
@@ -348,9 +372,10 @@
           if (e.payload && typeof e.payload === "object") setLanguage(e.payload.ui_language);
         }),
         win.onMoved(() => {
-          hovered = false;
+          if (!isLinux) hovered = false;
           updateDockSide();
         }),
+        ...(isLinux ? [on<boolean>("widget-hover", (e) => (hovered = e.payload === true))] : []),
         win.onResized(() => updateDockSide()),
         win.onScaleChanged(() => updateDockSide()),
       ]);
@@ -461,7 +486,11 @@
       <span class="halo"></span>
     </button>
 
-    <div class="center" data-tauri-drag-region>
+    <div
+      class="center"
+      data-tauri-drag-region
+      title={isLinux && flash && status.status !== "recording" ? flash.text : undefined}
+    >
       {#if status.status === "recording"}
         <div class="wave" aria-label={t("w.level")}>
           {#each levels as value}
@@ -883,5 +912,32 @@
     .brand.shimmer {
       animation: none !important;
     }
+  }
+
+  :global(:root[data-platform="linux"]) .icon,
+  :global(:root[data-platform="linux"]) .seal,
+  :global(:root[data-platform="linux"]) .proc-cancel {
+    padding: 0;
+  }
+
+  :global(:root[data-platform="linux"]) .core {
+    inset: auto;
+    top: 50%;
+    left: 50%;
+    margin: 0;
+    translate: -50% -50%;
+  }
+
+  :global(:root[data-platform="linux"]) .icon,
+  :global(:root[data-platform="linux"]) .proc-cancel {
+    position: relative;
+  }
+
+  :global(:root[data-platform="linux"]) .icon > :global(svg),
+  :global(:root[data-platform="linux"]) .proc-cancel > :global(svg) {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    translate: -50% -50%;
   }
 </style>

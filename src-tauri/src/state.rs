@@ -400,7 +400,7 @@ impl AppState {
         let (installed, model_present) = self.local_ai_files();
         let backend = self.llama_backend.read().clone();
         let gpu = self.local_ai_gpu();
-        let fallback = cfg!(windows) && self.gpu_fallback_active();
+        let fallback = cfg!(any(windows, target_os = "linux")) && self.gpu_fallback_active();
         let device = if !installed {
             None
         } else if gpu {

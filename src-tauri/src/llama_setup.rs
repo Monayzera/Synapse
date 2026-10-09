@@ -26,7 +26,7 @@ const SETUP_RUNNING: &str = "Setup already in progress.";
 const SETUP_ABORTED: &str = "The local AI setup stopped unexpectedly. Please try again.";
 const SERVER_NOT_READY: &str = "The local server did not respond in time. Please try again.";
 const DEFAULT_GPU_LAYERS: i32 = 99;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 const LIST_DEVICES_TIMEOUT: Duration = Duration::from_secs(30);
 const SWAP_BUDGET: Duration = Duration::from_secs(10);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(90);
@@ -736,18 +736,44 @@ fn extract_package(archives: &[PathBuf], stage: &Path) -> AppResult<PathBuf> {
         .map(Path::to_path_buf)
         .ok_or_else(|| AppError::Download("invalid package structure".to_string()))?;
     if root != stage {
-        for entry in std::fs::read_dir(stage)? {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                std::fs::rename(entry.path(), root.join(entry.file_name()))?;
-            }
-        }
+        flatten_into(stage, &root)?;
     }
     set_executable(&root.join(BIN_NAME));
     Ok(root)
 }
 
-#[cfg(windows)]
+#[cfg(target_os = "linux")]
+fn flatten_into(dir: &Path, root: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.as_path() == root {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            flatten_into(&path, root)?;
+            if !root.starts_with(&path) {
+                std::fs::remove_dir(&path)?;
+            }
+        } else {
+            std::fs::rename(&path, root.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn flatten_into(stage: &Path, root: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(stage)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            std::fs::rename(entry.path(), root.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, target_os = "linux"))]
 async fn validate(root: &Path) -> Result<Vec<BackendDevice>, String> {
     let dir = root.to_path_buf();
     match tokio::task::spawn_blocking(move || list_devices(&dir)).await {
@@ -756,21 +782,26 @@ async fn validate(root: &Path) -> Result<Vec<BackendDevice>, String> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 async fn validate(_root: &Path) -> Result<Vec<BackendDevice>, String> {
     Ok(Vec::new())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn list_devices(dir: &Path) -> Result<Vec<BackendDevice>, String> {
     let mut command = std::process::Command::new(dir.join(BIN_NAME));
     command.arg("--list-devices");
-    let mut path = std::ffi::OsString::from(dir.as_os_str());
-    path.push(";");
-    if let Some(current) = std::env::var_os("PATH") {
-        path.push(current);
+    #[cfg(windows)]
+    {
+        let mut path = std::ffi::OsString::from(dir.as_os_str());
+        path.push(";");
+        if let Some(current) = std::env::var_os("PATH") {
+            path.push(current);
+        }
+        command.env("PATH", path);
     }
-    command.env("PATH", path);
+    #[cfg(target_os = "linux")]
+    crate::sidecar::prepend_library_path(&mut command, dir);
     command.env_remove("CUDA_VISIBLE_DEVICES");
     let text = crate::sidecar::run_capture(command, LIST_DEVICES_TIMEOUT)?;
     if !text.contains("Available devices") {
@@ -1100,7 +1131,7 @@ pub async fn startup(state: &SharedState) -> bool {
 }
 
 async fn refresh_backend(state: &SharedState, gpu: Option<&GpuInfo>) {
-    if !cfg!(windows) {
+    if !cfg!(any(windows, target_os = "linux")) {
         return;
     }
     let exe = state.sidecar_binary();
@@ -1250,7 +1281,8 @@ pub async fn detect_repairable(state: &SharedState, refresh: bool) {
 fn update_repairable(state: &SharedState, gpu: Option<&GpuInfo>) {
     let installed = state.sidecar_binary().exists();
     let backend = state.llama_backend.read().clone();
-    let value = cfg!(windows) && repairable_for(gpu, installed, backend.as_ref());
+    let value =
+        cfg!(any(windows, target_os = "linux")) && repairable_for(gpu, installed, backend.as_ref());
     if state.local_ai_repairable.swap(value, Ordering::AcqRel) != value {
         tracing::info!("local AI repair available: {value}");
     }
@@ -1284,19 +1316,19 @@ fn cuda13_upgrade(gpu: &GpuInfo, info: &BackendInfo) -> bool {
 }
 
 fn plan_for(gpu: Option<&GpuInfo>) -> Vec<Want> {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     {
-        windows_plan(gpu)
+        gpu_plan(gpu)
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = gpu;
         vec![Want::Cpu]
     }
 }
 
-#[cfg(any(windows, test))]
-fn windows_plan(gpu: Option<&GpuInfo>) -> Vec<Want> {
+#[cfg(any(windows, target_os = "linux", test))]
+fn gpu_plan(gpu: Option<&GpuInfo>) -> Vec<Want> {
     let Some(gpu) = gpu else {
         return vec![Want::Cpu];
     };
@@ -1518,6 +1550,7 @@ fn html_assets(html: &str, tag: &str) -> AppResult<Vec<Asset>> {
     Ok(out)
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 fn pick<'a>(assets: &'a [Asset], must: &[&str], must_not: &[&str]) -> Option<&'a Asset> {
     assets.iter().find(|a| {
         let lower = a.name.to_ascii_lowercase();
@@ -1527,8 +1560,17 @@ fn pick<'a>(assets: &'a [Asset], must: &[&str], must_not: &[&str]) -> Option<&'a
     })
 }
 
+#[cfg(target_os = "linux")]
+const CUDA_BUILD: &str = "bin-ubuntu-cuda-";
+#[cfg(target_os = "linux")]
+const CUDA_ARCHIVE_SUFFIX: &str = "-x64.tar.gz";
+#[cfg(not(target_os = "linux"))]
+const CUDA_BUILD: &str = "bin-win-cuda-";
+#[cfg(not(target_os = "linux"))]
+const CUDA_ARCHIVE_SUFFIX: &str = "-x64.zip";
+
 fn cuda_version_after(lower: &str, marker: &str) -> Option<(u32, u32)> {
-    let rest = lower.strip_suffix("-x64.zip")?;
+    let rest = lower.strip_suffix(CUDA_ARCHIVE_SUFFIX)?;
     let index = rest.find(marker)?;
     let (major, minor) = rest[index + marker.len()..].split_once('.')?;
     Some((major.parse().ok()?, minor.parse().ok()?))
@@ -1539,13 +1581,13 @@ fn llama_cuda_version(name: &str) -> Option<(u32, u32)> {
     if !lower.starts_with("llama-") {
         return None;
     }
-    cuda_version_after(&lower, "-bin-win-cuda-")
+    cuda_version_after(&lower, &format!("-{CUDA_BUILD}"))
 }
 
 fn cudart_cuda_version(name: &str) -> Option<(u32, u32)> {
     let lower = name.to_ascii_lowercase();
     let rest = lower.strip_prefix("cudart-llama-")?;
-    let index = rest.find("bin-win-cuda-")?;
+    let index = rest.find(CUDA_BUILD)?;
     let build = &rest[..index];
     let build_ok = build.is_empty()
         || build
@@ -1555,7 +1597,7 @@ fn cudart_cuda_version(name: &str) -> Option<(u32, u32)> {
     if !build_ok {
         return None;
     }
-    cuda_version_after(&lower, "bin-win-cuda-")
+    cuda_version_after(&lower, CUDA_BUILD)
 }
 
 fn cuda_package(assets: &[Asset], major: u32) -> Option<(String, Asset, Asset)> {
@@ -1590,7 +1632,7 @@ fn package_for(assets: &[Asset], want: Want) -> Option<Package> {
                 files: vec![llama, cudart],
             })
         }
-        Want::Vulkan => pick(assets, &["-bin-win-vulkan-x64.zip"], &[]).map(|asset| Package {
+        Want::Vulkan => vulkan_asset(assets).map(|asset| Package {
             want,
             variant: "vulkan".to_string(),
             files: vec![asset.clone()],
@@ -1611,12 +1653,35 @@ fn native_variant() -> &'static str {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn build_asset<'a>(assets: &'a [Asset], suffix: &str) -> Option<&'a Asset> {
+    assets.iter().find(|asset| {
+        asset
+            .name
+            .to_ascii_lowercase()
+            .strip_prefix("llama-")
+            .and_then(|rest| rest.strip_suffix(suffix))
+            .and_then(|tag| tag.strip_prefix('b'))
+            .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()))
+    })
+}
+
+fn vulkan_asset(assets: &[Asset]) -> Option<&Asset> {
+    #[cfg(target_os = "linux")]
+    let asset = build_asset(assets, "-bin-ubuntu-vulkan-x64.tar.gz");
+    #[cfg(not(target_os = "linux"))]
+    let asset = pick(assets, &["-bin-win-vulkan-x64.zip"], &[]);
+    asset
+}
+
 fn cpu_asset(assets: &[Asset]) -> Option<&Asset> {
     #[cfg(windows)]
     let asset = pick(assets, &["win-cpu", "x64", ".zip"], &[]);
     #[cfg(target_os = "macos")]
     let asset = pick(assets, &["macos-arm64"], &[]);
-    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    let asset = build_asset(assets, "-bin-ubuntu-x64.tar.gz");
+    #[cfg(all(not(windows), not(target_os = "macos"), not(target_os = "linux")))]
     let asset = pick(assets, &["ubuntu", "x64"], &["cuda"]);
     asset
 }
@@ -1735,6 +1800,7 @@ mod tests {
         "llama-b11159-bin-win-cuda-13.4-x64.zip",
     ];
 
+    #[cfg(not(target_os = "linux"))]
     const B11433: [&str; 22] = [
         "cudart-llama-b11433-bin-ubuntu-cuda-12.8-x64.tar.gz",
         "cudart-llama-b11433-bin-ubuntu-cuda-13.4-x64.tar.gz",
@@ -1924,21 +1990,22 @@ mod tests {
         let cuda13 = vec![Want::Cuda(13), Want::Vulkan, Want::Cpu];
         let cuda12 = vec![Want::Cuda(12), Want::Vulkan, Want::Cpu];
         let vulkan = vec![Want::Vulkan, Want::Cpu];
-        assert_eq!(windows_plan(Some(&nvidia(Some("12.0"), Some("610.88")))), cuda13);
-        assert_eq!(windows_plan(Some(&nvidia(Some("7.5"), Some("580.00")))), cuda13);
-        assert_eq!(windows_plan(Some(&nvidia(Some("8.6"), Some("566.36")))), cuda12);
-        assert_eq!(windows_plan(Some(&nvidia(Some("7.0"), Some("610.88")))), cuda12);
-        assert_eq!(windows_plan(Some(&nvidia(Some("6.1"), Some("610.88")))), cuda12);
-        assert_eq!(windows_plan(Some(&nvidia(None, Some("610.88")))), cuda12);
-        assert_eq!(windows_plan(Some(&nvidia(Some("6.1"), Some("551.61")))), cuda12);
-        assert_eq!(windows_plan(Some(&nvidia(Some("6.1"), Some("546.33")))), vulkan);
-        assert_eq!(windows_plan(Some(&nvidia(None, None))), vulkan);
-        assert_eq!(windows_plan(Some(&other(GpuVendor::Amd))), vulkan);
-        assert_eq!(windows_plan(Some(&other(GpuVendor::Intel))), vulkan);
-        assert_eq!(windows_plan(Some(&other(GpuVendor::Other))), vulkan);
-        assert_eq!(windows_plan(None), vec![Want::Cpu]);
+        assert_eq!(gpu_plan(Some(&nvidia(Some("12.0"), Some("610.88")))), cuda13);
+        assert_eq!(gpu_plan(Some(&nvidia(Some("7.5"), Some("580.00")))), cuda13);
+        assert_eq!(gpu_plan(Some(&nvidia(Some("8.6"), Some("566.36")))), cuda12);
+        assert_eq!(gpu_plan(Some(&nvidia(Some("7.0"), Some("610.88")))), cuda12);
+        assert_eq!(gpu_plan(Some(&nvidia(Some("6.1"), Some("610.88")))), cuda12);
+        assert_eq!(gpu_plan(Some(&nvidia(None, Some("610.88")))), cuda12);
+        assert_eq!(gpu_plan(Some(&nvidia(Some("6.1"), Some("551.61")))), cuda12);
+        assert_eq!(gpu_plan(Some(&nvidia(Some("6.1"), Some("546.33")))), vulkan);
+        assert_eq!(gpu_plan(Some(&nvidia(None, None))), vulkan);
+        assert_eq!(gpu_plan(Some(&other(GpuVendor::Amd))), vulkan);
+        assert_eq!(gpu_plan(Some(&other(GpuVendor::Intel))), vulkan);
+        assert_eq!(gpu_plan(Some(&other(GpuVendor::Other))), vulkan);
+        assert_eq!(gpu_plan(None), vec![Want::Cpu]);
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn b11433_assets_resolve_per_variant() {
         let list = assets(&B11433);
@@ -1978,6 +2045,7 @@ mod tests {
         assert_eq!(package_for(&list, Want::Cpu).map(|p| p.variant), Some("cpu".to_string()));
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn cuda_package_requires_cudart_of_the_same_version() {
         let missing = assets(&[
@@ -2396,5 +2464,215 @@ mod tests {
         assert!(patient.is_ok(), "{patient:?}");
         assert!(started.elapsed() >= Duration::from_millis(300));
         assert!(!root.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    const B11476_UBUNTU: [&str; 15] = [
+        "cudart-llama-b11476-bin-ubuntu-cuda-12.8-x64.tar.gz",
+        "cudart-llama-b11476-bin-ubuntu-cuda-13.4-arm64.tar.gz",
+        "cudart-llama-b11476-bin-ubuntu-cuda-13.4-x64.tar.gz",
+        "llama-b11476-bin-ubuntu-arm64.tar.gz",
+        "llama-b11476-bin-ubuntu-cuda-12.8-x64.tar.gz",
+        "llama-b11476-bin-ubuntu-cuda-13.4-arm64.tar.gz",
+        "llama-b11476-bin-ubuntu-cuda-13.4-x64.tar.gz",
+        "llama-b11476-bin-ubuntu-openvino-2026.4.1-x64.tar.gz",
+        "llama-b11476-bin-ubuntu-rocm-10.0-x64.tar.gz",
+        "llama-b11476-bin-ubuntu-s390x.tar.gz",
+        "llama-b11476-bin-ubuntu-sycl-fp16-x64.tar.gz",
+        "llama-b11476-bin-ubuntu-sycl-fp32-x64.tar.gz",
+        "llama-b11476-bin-ubuntu-vulkan-arm64.tar.gz",
+        "llama-b11476-bin-ubuntu-vulkan-x64.tar.gz",
+        "llama-b11476-bin-ubuntu-x64.tar.gz",
+    ];
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_assets_resolve_per_variant_from_b11476() {
+        let list = assets(&B11476_UBUNTU);
+        assert_eq!(
+            files(package_for(&list, Want::Cuda(13))),
+            vec![
+                "llama-b11476-bin-ubuntu-cuda-13.4-x64.tar.gz",
+                "cudart-llama-b11476-bin-ubuntu-cuda-13.4-x64.tar.gz"
+            ]
+        );
+        assert_eq!(
+            package_for(&list, Want::Cuda(13)).map(|p| p.variant),
+            Some("cuda-13.4".to_string())
+        );
+        assert_eq!(
+            files(package_for(&list, Want::Cuda(12))),
+            vec![
+                "llama-b11476-bin-ubuntu-cuda-12.8-x64.tar.gz",
+                "cudart-llama-b11476-bin-ubuntu-cuda-12.8-x64.tar.gz"
+            ]
+        );
+        assert_eq!(
+            files(package_for(&list, Want::Vulkan)),
+            vec!["llama-b11476-bin-ubuntu-vulkan-x64.tar.gz"]
+        );
+        assert_eq!(
+            files(package_for(&list, Want::Cpu)),
+            vec!["llama-b11476-bin-ubuntu-x64.tar.gz"]
+        );
+        assert_eq!(package_for(&list, Want::Cpu).map(|p| p.variant), Some("cpu".to_string()));
+        assert!(package_for(&list, Want::Cuda(11)).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_cpu_asset_ignores_openvino_rocm_and_sycl_builds() {
+        let list = assets(&B11476_UBUNTU);
+        assert_eq!(
+            cpu_asset(&list).map(|a| a.name.as_str()),
+            Some("llama-b11476-bin-ubuntu-x64.tar.gz")
+        );
+        let openvino = assets(&["llama-b11476-bin-ubuntu-openvino-2026.4.1-x64.tar.gz"]);
+        assert!(cpu_asset(&openvino).is_none());
+        assert!(cpu_asset(&assets(&["llama-bx-bin-ubuntu-x64.tar.gz"])).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_cuda_package_requires_matching_cudart() {
+        let missing = assets(&[
+            "llama-b1-bin-ubuntu-cuda-13.5-x64.tar.gz",
+            "cudart-llama-b1-bin-ubuntu-cuda-13.4-x64.tar.gz",
+        ]);
+        assert!(package_for(&missing, Want::Cuda(13)).is_none());
+        let arm = assets(&[
+            "llama-b1-bin-ubuntu-cuda-13.4-arm64.tar.gz",
+            "cudart-llama-b1-bin-ubuntu-cuda-13.4-arm64.tar.gz",
+        ]);
+        assert!(package_for(&arm, Want::Cuda(13)).is_none());
+        assert_eq!(cudart_cuda_version("cudart-llama-bin-win-cuda-13.4-x64.zip"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_release_prefers_the_gpu_build_then_cpu() {
+        let plan = [Want::Cuda(13), Want::Vulkan, Want::Cpu];
+        let complete = release("b11476", false, &B11476_UBUNTU);
+        let cpu_only = release("b11477", false, &["llama-b11477-bin-ubuntu-x64.tar.gz"]);
+        let selected = select_release(&[cpu_only.clone(), complete], &plan).map(|(tag, _)| tag);
+        assert_eq!(selected.as_deref(), Some("b11476"));
+        let fallback = select_release(&[cpu_only], &plan).map(|(tag, _)| tag);
+        assert_eq!(fallback.as_deref(), Some("b11477"));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn tar_entry<W: std::io::Write>(
+        archive: &mut tar::Builder<W>,
+        name: &str,
+        mode: u32,
+        body: &[u8],
+    ) -> std::io::Result<()> {
+        let mut header = tar::Header::new_gnu();
+        header.set_path(name)?;
+        header.set_size(body.len() as u64);
+        header.set_mode(mode);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        archive.append(&header, body)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn tar_link<W: std::io::Write>(
+        archive: &mut tar::Builder<W>,
+        name: &str,
+        target: &str,
+    ) -> std::io::Result<()> {
+        let mut header = tar::Header::new_gnu();
+        header.set_path(name)?;
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_link_name(target)?;
+        header.set_cksum();
+        archive.append(&header, std::io::empty())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn targz_fixture(path: &Path) -> std::io::Result<()> {
+        let file = std::fs::File::create(path)?;
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        let mut archive = tar::Builder::new(encoder);
+        tar_entry(&mut archive, "llama-b1/llama-server", 0o755, b"server")?;
+        tar_entry(&mut archive, "llama-b1/llama-cli", 0o755, b"cli")?;
+        tar_entry(&mut archive, "llama-b1/libllama.so.1", 0o644, b"lib")?;
+        tar_link(&mut archive, "llama-b1/libllama.so", "libllama.so.1")?;
+        archive.into_inner()?.finish()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cudart_fixture(path: &Path) -> std::io::Result<()> {
+        let file = std::fs::File::create(path)?;
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        let mut archive = tar::Builder::new(encoder);
+        tar_entry(&mut archive, "libcudart.so.13.1", 0o755, b"cudart")?;
+        tar_link(&mut archive, "libcudart.so.13", "libcudart.so.13.1")?;
+        tar_entry(&mut archive, "cudart-extra/libcublas.so.13", 0o644, b"cublas")?;
+        archive.into_inner()?.finish()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_targz_keeps_symlinks_and_exec_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_dir("targz");
+        assert!(std::fs::create_dir_all(&root).is_ok());
+        let archive = root.join("llama-b1-bin-ubuntu-x64.tar.gz");
+        assert!(targz_fixture(&archive).is_ok());
+        let stage = root.join(STAGE_DIR);
+        let extracted = extract_package(&[archive], &stage);
+        let package_dir = stage.join("llama-b1");
+        assert_eq!(extracted.ok(), Some(package_dir.clone()));
+        assert!(std::fs::metadata(package_dir.join("llama-cli"))
+            .is_ok_and(|meta| (meta.permissions().mode() & 0o777) == 0o755));
+        assert!(std::fs::metadata(package_dir.join(BIN_NAME))
+            .is_ok_and(|meta| (meta.permissions().mode() & 0o777) == 0o755));
+        let link = package_dir.join("libllama.so");
+        assert!(std::fs::symlink_metadata(&link).is_ok_and(|meta| meta.file_type().is_symlink()));
+        assert_eq!(std::fs::read_link(&link).ok(), Some(PathBuf::from("libllama.so.1")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_cudart_companion_lands_next_to_llama_server() {
+        let root = scratch_dir("cudart");
+        assert!(std::fs::create_dir_all(&root).is_ok());
+        let llama = root.join("llama-b1-bin-ubuntu-cuda-13.4-x64.tar.gz");
+        assert!(targz_fixture(&llama).is_ok());
+        let cudart = root.join("cudart-llama-b1-bin-ubuntu-cuda-13.4-x64.tar.gz");
+        assert!(cudart_fixture(&cudart).is_ok());
+        let stage = root.join(STAGE_DIR);
+        let extracted = extract_package(&[llama, cudart], &stage);
+        let package_dir = stage.join("llama-b1");
+        assert_eq!(extracted.ok(), Some(package_dir.clone()));
+        let link = package_dir.join("libcudart.so.13");
+        assert!(std::fs::symlink_metadata(&link).is_ok_and(|meta| meta.file_type().is_symlink()));
+        assert_eq!(std::fs::read_link(&link).ok(), Some(PathBuf::from("libcudart.so.13.1")));
+        assert!(std::fs::metadata(&link).is_ok_and(|meta| meta.is_file()));
+        assert!(package_dir.join("libcudart.so.13.1").is_file());
+        assert!(package_dir.join("libcublas.so.13").is_file());
+        assert!(!stage.join("cudart-extra").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_list_devices_runs_the_binary_in_its_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("devices");
+        assert!(std::fs::create_dir_all(&dir).is_ok());
+        let server = dir.join(BIN_NAME);
+        let script = "#!/bin/sh\necho 'Available devices:'\necho '  Vulkan0: AMD Radeon RX 6600 (8176 MiB, 8064 MiB free)'\n";
+        assert!(std::fs::write(&server, script).is_ok());
+        assert!(std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).is_ok());
+        assert_eq!(list_devices(&dir), Ok(vec![device("Vulkan0", "AMD Radeon RX 6600")]));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

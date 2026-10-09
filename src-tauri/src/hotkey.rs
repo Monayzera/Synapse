@@ -14,7 +14,9 @@ pub fn apply(_app: &AppHandle, state: &SharedState) -> AppResult<()> {
     let parsed = crate::inputhook::set_bindings(&settings);
     #[cfg(target_os = "macos")]
     let parsed = crate::inputhook_mac::set_bindings(&settings);
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    let parsed = crate::inputhook_linux::set_bindings(&settings);
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     let parsed = {
         SETTLED.store(true, Ordering::Release);
         false

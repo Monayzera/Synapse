@@ -546,3 +546,49 @@ pub fn hide_window(app: AppHandle, label: String) -> Result<(), String> {
 pub async fn open_privacy_settings(kind: String) -> Result<(), String> {
     permissions::open_privacy_settings(&kind)
 }
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub fn retry_hotkey() -> Result<(), String> {
+    crate::inputhook_linux::retry_after_denial();
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub async fn widget_resize(app: AppHandle, width: f64, height: f64) -> Result<(), String> {
+    crate::on_main_thread(&app, move |app| match app.get_webview_window("widget") {
+        Some(window) => crate::set_widget_size(&window, width, height),
+        None => Err("widget window not found".to_string()),
+    })
+    .await
+    .unwrap_or_else(|| Err("the main thread did not run the widget resize".to_string()))
+}
+
+#[cfg(target_os = "linux")]
+#[derive(serde::Serialize)]
+pub struct WidgetMonitor {
+    position: tauri::PhysicalPosition<i32>,
+    size: tauri::PhysicalSize<u32>,
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub async fn widget_monitor(app: AppHandle) -> Option<WidgetMonitor> {
+    crate::on_main_thread(&app, |app| {
+        app.get_webview_window("widget")
+            .and_then(|window| match window.current_monitor() {
+                Ok(Some(monitor)) => Some(WidgetMonitor {
+                    position: *monitor.position(),
+                    size: *monitor.size(),
+                }),
+                Ok(None) => None,
+                Err(err) => {
+                    tracing::warn!("widget monitor unavailable: {err}");
+                    None
+                }
+            })
+    })
+    .await
+    .flatten()
+}

@@ -8,6 +8,10 @@
   import { app, commit, checkUpdate, installUpdate, fmtBytes } from "./store.svelte";
 
   const REPO = "https://github.com/Monayzera/Synapse";
+  const isLinux =
+    typeof navigator !== "undefined" &&
+    /Linux/i.test(navigator.userAgent) &&
+    !/Android/i.test(navigator.userAgent);
 
   type Action = "check" | "checking" | "update" | "install" | null;
   type Hint = "busy" | "unsaved" | null;
@@ -77,6 +81,8 @@
         return t("about.errSignature");
       case "not_completed":
         return t("about.errNotCompleted", { v: u.version ?? "" });
+      case "relaunch":
+        return t("about.errRelaunch");
       default:
         return t("about.errUnknown");
     }
@@ -101,6 +107,9 @@
         if (u.error === "location_move") {
           return { label: t("about.available", { v }), sub: t("about.errMove"), err: true, action: none, progress: -1 };
         }
+        if (isLinux && u.error === "location_admin") {
+          return { label: t("about.available", { v }), sub: t("about.errLocationLinux"), err: true, action: none, progress: -1 };
+        }
         return { label: t("about.available", { v }), sub: checked, err: false, action: "update" as Action, progress: -1 };
       case "downloading": {
         const p = percent(u);
@@ -119,8 +128,9 @@
           err = true;
           action = null;
         } else if (u.error === "location_admin") {
-          sub = t("about.errLocation");
+          sub = t(isLinux ? "about.errLocationLinux" : "about.errLocation");
           err = true;
+          if (isLinux) action = null;
         } else if (u.blocked && s.auto_update) {
           sub = t("about.readyBlocked");
           err = true;
@@ -137,7 +147,8 @@
       default: {
         const transient = u.error === "network" || u.error === "unavailable" || u.error === "download";
         const sub = transient && s.auto_update ? t("about.retryAuto") : checked;
-        return { label: errorLabel(u), sub, err: false, action: "check" as Action, progress: -1 };
+        const action: Action = u.error === "relaunch" ? none : "check";
+        return { label: errorLabel(u), sub, err: false, action, progress: -1 };
       }
     }
   });

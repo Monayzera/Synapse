@@ -5,6 +5,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-d97757?style=flat-square&labelColor=1b1a16" alt="Windows 10 | 11">
   <img src="https://img.shields.io/badge/macOS-Apple%20Silicon-d97757?style=flat-square&labelColor=1b1a16" alt="macOS Apple Silicon">
+  <img src="https://img.shields.io/badge/Linux-Ubuntu%2024.04%2B-d97757?style=flat-square&labelColor=1b1a16" alt="Linux Ubuntu 24.04+">
   <img src="https://img.shields.io/badge/license-MIT-d97757?style=flat-square&labelColor=1b1a16" alt="MIT license">
 </p>
 
@@ -38,21 +39,33 @@ scripts\windows\run-dev.bat
 
 Then open Settings from the widget, pick a model under **Voice**, and hold `Ctrl+Shift+Space` to dictate.
 
+**Linux (Ubuntu 24.04+)**
+
+```bash
+./scripts/linux/setup.sh
+./scripts/linux/run-dev.sh
+```
+
+`setup.sh` needs Node.js 22 or newer already installed. It installs the system packages (it asks for your sudo password), Rust, and the frontend dependencies. `run-dev.sh` compiles and opens the app.
+
+Then open Settings from the widget, pick a model under **Voice**, and hold `Ctrl+Shift+Space` to dictate. On GNOME, the system asks you to confirm the shortcut the first time and after each change. It also asks for permission to let Synapse control the keyboard, so it can paste.
+
 ## Build
 
 | Command | Output |
 |---|---|
 | `scripts\windows\build.bat` | Windows installer for every PC, uses an NVIDIA GPU when available (building requires the CUDA Toolkit) |
 | `./scripts/macos/build-dmg.sh` | macOS `.dmg`, Apple Silicon |
+| `./scripts/linux/build.sh` | Linux `.AppImage` and `.deb` for x86_64, uses a Vulkan GPU when available |
 
 Output goes to `src-tauri/target/release/bundle/`.
 
 ## Data
 
-| | Windows | macOS |
-|---|---|---|
-| Settings, models, history | `Documents\Synapse` | `~/Library/Application Support/Synapse` |
-| Logs | `%LOCALAPPDATA%\com.synapse.voice\logs` | `~/Library/Application Support/com.synapse.voice/logs` |
+| | Windows | macOS | Linux |
+|---|---|---|---|
+| Settings, models, history | `Documents\Synapse` | `~/Library/Application Support/Synapse` | `~/.local/share/Synapse` |
+| Logs | `%LOCALAPPDATA%\com.synapse.voice\logs` | `~/Library/Application Support/com.synapse.voice/logs` | `~/.local/share/com.synapse.voice/logs` |
 
 Audio and text stay on your machine unless you choose Groq or a remote AI endpoint.
 

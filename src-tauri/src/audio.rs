@@ -152,6 +152,7 @@ pub fn list_devices() -> Vec<String> {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn enumerate_input_names() -> Vec<String> {
     let host = cpal::default_host();
     let mut names = Vec::new();
@@ -166,6 +167,97 @@ fn enumerate_input_names() -> Vec<String> {
         Err(err) => tracing::warn!("audio device enumeration failed: {err}"),
     }
     names
+}
+
+#[cfg(target_os = "linux")]
+fn enumerate_input_names() -> Vec<String> {
+    linux_input_entries(&cpal::default_host())
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_input_entries(host: &cpal::Host) -> Vec<(String, cpal::Device)> {
+    let devices = match host.input_devices() {
+        Ok(devices) => devices,
+        Err(err) => {
+            tracing::warn!("audio device enumeration failed: {err}");
+            return Vec::new();
+        }
+    };
+    let mut candidates = Vec::new();
+    for device in devices {
+        let pcm_id = match device.id() {
+            Ok(id) => id.id().to_string(),
+            Err(err) => {
+                tracing::warn!("audio device id unavailable: {err}");
+                continue;
+            }
+        };
+        if let Some(name) = device_name(&device) {
+            candidates.push((pcm_id, name, device));
+        }
+    }
+    choose_linux_entries(candidates)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_pcm_rank(pcm_id: &str) -> Option<u8> {
+    if pcm_id == "default" {
+        return Some(0);
+    }
+    let (prefix, target) = pcm_id.split_once(':')?;
+    if !target.starts_with("CARD=") {
+        return None;
+    }
+    match prefix {
+        "sysdefault" => Some(1),
+        "plughw" => Some(2),
+        "hw" => Some(3),
+        _ => None,
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_card_id(pcm_id: &str) -> Option<&str> {
+    let (_, target) = pcm_id.split_once(':')?;
+    let card = target.strip_prefix("CARD=")?;
+    card.split(',').next()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn choose_linux_entries<T>(candidates: Vec<(String, String, T)>) -> Vec<(String, T)> {
+    let mut ranked: Vec<(u8, Option<String>, String, T)> = Vec::new();
+    for (pcm_id, name, value) in candidates {
+        let rank = match linux_pcm_rank(&pcm_id) {
+            Some(rank) => rank,
+            None => continue,
+        };
+        let card = linux_card_id(&pcm_id).map(str::to_string);
+        match ranked.iter().position(|(_, existing_card, existing, _)| {
+            *existing == name && *existing_card == card
+        }) {
+            Some(index) => {
+                if rank < ranked[index].0 {
+                    ranked[index] = (rank, card, name, value);
+                }
+            }
+            None => ranked.push((rank, card, name, value)),
+        }
+    }
+    let names: Vec<String> = ranked.iter().map(|(_, _, name, _)| name.clone()).collect();
+    ranked.sort_by_key(|(rank, _, _, _)| *rank);
+    ranked
+        .into_iter()
+        .map(|(_, card, name, value)| {
+            let shared = names.iter().filter(|other| **other == name).count() > 1;
+            match card {
+                Some(card) if shared => (format!("{name} ({card})"), value),
+                _ => (name, value),
+            }
+        })
+        .collect()
 }
 
 fn device_name(device: &cpal::Device) -> Option<String> {
@@ -331,6 +423,12 @@ impl Worker {
                 tracing::warn!("audio stream play failed ({err}); rebuilding once");
                 self.rebuild(shared, "play failed");
             }
+            #[cfg(target_os = "linux")]
+            Some(Err(err)) => {
+                tracing::warn!("audio stream pause failed ({err}); releasing the input device");
+                self.drop_stream();
+            }
+            #[cfg(not(target_os = "linux"))]
             Some(Err(err)) => tracing::debug!("audio stream pause failed: {err}"),
             None if on => self.rebuild(shared, "recording requested without a stream"),
             None => {}
@@ -356,7 +454,8 @@ impl Worker {
         self.drop_stream();
         self.retry_at = None;
         self.generation = self.generation.wrapping_add(1);
-        match build_stream(&self.preferred, shared, self.generation) {
+        let built = build_stream(&self.preferred, shared, self.generation);
+        match built {
             Ok(built) => {
                 let started = if self.active {
                     built.stream.play()
@@ -374,21 +473,32 @@ impl Worker {
                         shared.available.store(false, Ordering::Release);
                         self.schedule_retry();
                     }
+                    #[cfg(target_os = "linux")]
+                    Err(err) => {
+                        tracing::warn!(
+                            "audio input '{}' could not be paused ({err}); releasing it until recording starts",
+                            built.name
+                        );
+                        drop_quietly(built.stream);
+                        shared.available.store(true, Ordering::Release);
+                    }
                     other => {
                         if let Err(err) = other {
                             tracing::debug!("audio stream pause after build failed: {err}");
                         }
-                        tracing::info!(
-                            "audio input ready: '{}' ({} Hz, {} ch{}) [{reason}]",
-                            built.name,
-                            built.sample_rate,
-                            built.channels,
-                            if built.fallback {
-                                ", preferred device missing, using default"
-                            } else {
-                                ""
-                            }
-                        );
+                        if !(cfg!(target_os = "linux") && built.fallback && self.on_fallback) {
+                            tracing::info!(
+                                "audio input ready: '{}' ({} Hz, {} ch{}) [{reason}]",
+                                built.name,
+                                built.sample_rate,
+                                built.channels,
+                                if built.fallback {
+                                    ", preferred device missing, using default"
+                                } else {
+                                    ""
+                                }
+                            );
+                        }
                         self.stream = Some(built.stream);
                         self.on_fallback = built.fallback;
                         self.built_at = Some(Instant::now());
@@ -441,6 +551,7 @@ fn jittered(base: Duration, seed: &mut u64) -> Duration {
     base.mul_f64(factor)
 }
 
+#[cfg(not(target_os = "linux"))]
 fn preferred_present(preferred: &Option<String>) -> bool {
     let target = match preferred {
         Some(target) => target,
@@ -455,6 +566,18 @@ fn preferred_present(preferred: &Option<String>) -> bool {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn preferred_present(preferred: &Option<String>) -> bool {
+    let target = match preferred {
+        Some(target) => target,
+        None => return false,
+    };
+    linux_input_entries(&cpal::default_host())
+        .iter()
+        .any(|(name, _)| name == target)
+}
+
+#[cfg(not(target_os = "linux"))]
 fn select_device(host: &cpal::Host, preferred: &Option<String>) -> Option<(cpal::Device, bool)> {
     match preferred {
         Some(target) => {
@@ -464,6 +587,22 @@ fn select_device(host: &cpal::Host, preferred: &Option<String>) -> Option<(cpal:
                         return Some((device, false));
                     }
                 }
+            }
+            host.default_input_device().map(|device| (device, true))
+        }
+        None => host.default_input_device().map(|device| (device, false)),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn select_device(host: &cpal::Host, preferred: &Option<String>) -> Option<(cpal::Device, bool)> {
+    match preferred {
+        Some(target) => {
+            if let Some((_, device)) = linux_input_entries(host)
+                .into_iter()
+                .find(|(name, _)| name == target)
+            {
+                return Some((device, false));
             }
             host.default_input_device().map(|device| (device, true))
         }
@@ -650,4 +789,126 @@ fn resample(input: &[f32], in_rate: u32, out_rate: u32) -> Vec<f32> {
         cursor = end;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{choose_linux_entries, linux_pcm_rank};
+
+    fn entry(pcm_id: &str, name: &str, value: u32) -> (String, String, u32) {
+        (pcm_id.to_string(), name.to_string(), value)
+    }
+
+    #[test]
+    fn linux_pcm_rank_keeps_default_and_card_pcms_only() {
+        assert_eq!(linux_pcm_rank("default"), Some(0));
+        assert_eq!(linux_pcm_rank("sysdefault:CARD=PCH"), Some(1));
+        assert_eq!(linux_pcm_rank("plughw:CARD=PCH,DEV=0"), Some(2));
+        assert_eq!(linux_pcm_rank("hw:CARD=0,DEV=2"), Some(3));
+        for dropped in [
+            "null",
+            "pipewire",
+            "front:CARD=PCH,DEV=0",
+            "dsnoop:CARD=PCH,DEV=2",
+            "surround51:CARD=PCH,DEV=0",
+            "dmix:CARD=PCH,DEV=0",
+            "iec958:CARD=PCH,DEV=0",
+            "hdmi:CARD=HDMI,DEV=3",
+            "lavrate:CARD=PCH,DEV=0",
+            "samplerate:CARD=PCH,DEV=0",
+            "speex:CARD=PCH,DEV=0",
+            "upmix:CARD=PCH,DEV=0",
+            "vdownmix:CARD=PCH,DEV=0",
+            "hw:0,0",
+        ] {
+            assert_eq!(linux_pcm_rank(dropped), None, "{dropped}");
+        }
+    }
+
+    #[test]
+    fn linux_entries_dedupe_by_description_and_prefer_sysdefault() {
+        let candidates = vec![
+            entry(
+                "null",
+                "Discard all samples (playback) or generate zero samples (capture)",
+                1,
+            ),
+            entry("pipewire", "PipeWire Sound Server", 2),
+            entry(
+                "default",
+                "Default ALSA Output (currently PipeWire Media Server)",
+                3,
+            ),
+            entry("hw:CARD=PCH,DEV=0", "HDA Intel PCH, ALC897 Analog", 4),
+            entry("hw:CARD=PCH,DEV=2", "HDA Intel PCH, ALC897 Alt Analog", 5),
+            entry("plughw:CARD=PCH,DEV=0", "HDA Intel PCH, ALC897 Analog", 6),
+            entry(
+                "plughw:CARD=PCH,DEV=2",
+                "HDA Intel PCH, ALC897 Alt Analog",
+                7,
+            ),
+            entry("sysdefault:CARD=PCH", "HDA Intel PCH, ALC897 Analog", 8),
+            entry("front:CARD=PCH,DEV=0", "HDA Intel PCH, ALC897 Analog", 9),
+            entry(
+                "dsnoop:CARD=PCH,DEV=2",
+                "HDA Intel PCH, ALC897 Alt Analog",
+                10,
+            ),
+        ];
+        assert_eq!(
+            choose_linux_entries(candidates),
+            vec![
+                (
+                    "Default ALSA Output (currently PipeWire Media Server)".to_string(),
+                    3
+                ),
+                ("HDA Intel PCH, ALC897 Analog".to_string(), 8),
+                ("HDA Intel PCH, ALC897 Alt Analog".to_string(), 7),
+            ]
+        );
+    }
+
+    #[test]
+    fn linux_entries_fall_back_to_hw_or_sysdefault_when_no_plughw() {
+        let candidates = vec![
+            entry("sysdefault:CARD=Mic", "USB Mic", 1),
+            entry("hw:CARD=Webcam,DEV=0", "Webcam Mic", 2),
+            entry("hw:CARD=Webcam,DEV=0", "Webcam Mic", 3),
+        ];
+        assert_eq!(
+            choose_linux_entries(candidates),
+            vec![("USB Mic".to_string(), 1), ("Webcam Mic".to_string(), 2)]
+        );
+    }
+
+    #[test]
+    fn linux_entries_keep_identical_devices_from_different_cards() {
+        let candidates = vec![
+            entry("sysdefault:CARD=Microphone", "Yeti Stereo Microphone", 1),
+            entry("plughw:CARD=Microphone,DEV=0", "Yeti Stereo Microphone", 2),
+            entry("sysdefault:CARD=Microphone_1", "Yeti Stereo Microphone", 3),
+        ];
+        assert_eq!(
+            choose_linux_entries(candidates),
+            vec![
+                ("Yeti Stereo Microphone (Microphone)".to_string(), 1),
+                ("Yeti Stereo Microphone (Microphone_1)".to_string(), 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn linux_entries_do_not_let_default_replace_a_card() {
+        let candidates = vec![
+            entry("default", "HDA Intel PCH, ALC897 Analog", 1),
+            entry("sysdefault:CARD=PCH", "HDA Intel PCH, ALC897 Analog", 2),
+        ];
+        assert_eq!(
+            choose_linux_entries(candidates),
+            vec![
+                ("HDA Intel PCH, ALC897 Analog".to_string(), 1),
+                ("HDA Intel PCH, ALC897 Analog (PCH)".to_string(), 2),
+            ]
+        );
+    }
 }

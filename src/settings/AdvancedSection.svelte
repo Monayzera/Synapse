@@ -40,6 +40,8 @@
         return t("adv.gpuUnsupported");
       case "blocked":
         return t("adv.gpuBlocked");
+      case "no_gpu":
+        return t("adv.gpuNoGpu");
       default:
         return "";
     }
