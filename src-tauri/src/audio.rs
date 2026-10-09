@@ -188,8 +188,14 @@ fn audio_host() -> Arc<cpal::Host> {
 }
 
 #[cfg(target_os = "linux")]
-fn forget_audio_host() {
-    PULSE_HOST.lock().take();
+fn drop_dead_audio_host() {
+    let mut cached = PULSE_HOST.lock();
+    if cached
+        .as_ref()
+        .is_some_and(|host| host.input_devices().is_err())
+    {
+        cached.take();
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -238,7 +244,7 @@ fn linux_input_entries(host: &cpal::Host) -> Vec<(String, cpal::Device)> {
         Ok(devices) => devices,
         Err(err) => {
             tracing::warn!("audio device enumeration failed: {err}");
-            forget_audio_host();
+            drop_dead_audio_host();
             return Vec::new();
         }
     };
@@ -456,7 +462,7 @@ impl Worker {
                 if generation == self.generation && self.stream.is_some() {
                     tracing::warn!("audio stream failed; scheduling rebuild");
                     #[cfg(target_os = "linux")]
-                    forget_audio_host();
+                    drop_dead_audio_host();
                     self.drop_stream();
                     shared.available.store(false, Ordering::Release);
                     self.schedule_retry();
@@ -640,7 +646,7 @@ impl Worker {
                     }
                     Err(err) => {
                         tracing::warn!("audio input '{name}' could not start ({err}); will retry");
-                        forget_audio_host();
+                        drop_dead_audio_host();
                         self.failures = self.failures.saturating_add(1);
                         shared.available.store(false, Ordering::Release);
                         self.schedule_retry();
@@ -648,7 +654,7 @@ impl Worker {
                 }
             }
             Err(err) => {
-                forget_audio_host();
+                drop_dead_audio_host();
                 self.failures = self.failures.saturating_add(1);
                 if self.failures == 1 || self.failures % 10 == 0 {
                     tracing::warn!(
