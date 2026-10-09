@@ -48,7 +48,7 @@ Then open Settings from the widget, pick a model under **Voice**, and hold `Ctrl
 
 `setup.sh` needs Node.js 22 or newer already installed. It installs the system packages (it asks for your sudo password), Rust, and the frontend dependencies. `run-dev.sh` compiles and opens the app.
 
-Then open Settings from the widget, pick a model under **Voice**, and hold `Ctrl+Shift+Space` to dictate. On GNOME, the system asks you to confirm the shortcut the first time and after each change. It also asks for permission to let Synapse control the keyboard, so it can paste.
+Then open Settings from the widget, pick a model under **Voice**, and hold `Ctrl+Shift+Space` to dictate. On GNOME, the system asks you to confirm the shortcut the first time and after each change. It also asks for permission to let Synapse control the keyboard, so it can paste. GNOME 46 and 47 on Wayland (Ubuntu 24.04 and 24.10) have no global shortcut service, so Synapse shows a command instead: bind it to a custom shortcut in Settings > Keyboard, and each press starts or stops dictation.
 
 ## Build
 

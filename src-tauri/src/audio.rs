@@ -413,6 +413,11 @@ impl Worker {
 
     fn set_active(&mut self, on: bool, shared: &Shared) {
         self.active = on;
+        #[cfg(target_os = "linux")]
+        if !on {
+            self.drop_stream();
+            return;
+        }
         let result = self
             .stream
             .as_ref()
@@ -423,12 +428,6 @@ impl Worker {
                 tracing::warn!("audio stream play failed ({err}); rebuilding once");
                 self.rebuild(shared, "play failed");
             }
-            #[cfg(target_os = "linux")]
-            Some(Err(err)) => {
-                tracing::warn!("audio stream pause failed ({err}); releasing the input device");
-                self.drop_stream();
-            }
-            #[cfg(not(target_os = "linux"))]
             Some(Err(err)) => tracing::debug!("audio stream pause failed: {err}"),
             None if on => self.rebuild(shared, "recording requested without a stream"),
             None => {}

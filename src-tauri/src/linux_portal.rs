@@ -70,6 +70,10 @@ pub async fn perform_registration() -> Result<(), String> {
 const DELETED_SUFFIX: &str = " (deleted)";
 
 pub fn appimage_path() -> Option<PathBuf> {
+    use tauri::utils::{config::BundleType, platform::bundle_type};
+    if bundle_type() != Some(BundleType::AppImage) {
+        return None;
+    }
     std::env::var_os("APPIMAGE")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)

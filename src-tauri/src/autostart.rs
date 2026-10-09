@@ -543,9 +543,9 @@ mod platform {
     }
 
     fn program_path() -> Result<String, String> {
-        let path = match std::env::var_os("APPIMAGE") {
-            Some(value) if !value.is_empty() => PathBuf::from(value),
-            _ => std::env::current_exe().map_err(|err| {
+        let path = match crate::linux_portal::appimage_path() {
+            Some(path) => path,
+            None => std::env::current_exe().map_err(|err| {
                 tracing::warn!("current exe unknown: {err}");
                 ERR_PROGRAM_INVALID.to_string()
             })?,
